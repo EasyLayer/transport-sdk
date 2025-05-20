@@ -1,7 +1,4 @@
 <p align=center>
-  <img height="80px" src=""/>
-</p>
-<p align=center>
   Universal Transport SDK for EasyLayer Apps.
 </p>
 <br>
