@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.cache/
+.next/
+.nuxt/
+out/
+public/
+coverage/
+*.log
+**/*.snap
+.vscode/
+.idea/
+*.d.ts

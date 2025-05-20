@@ -1,0 +1,33 @@
+name: Build-Lints-Unit Tests Workflow
+
+on:
+  pull_request:
+    branches: [master, development]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  all-in-one:
+    name: 'All-in-one (node: 22)'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Monorepo install
+        uses: ./.github/actions/yarn-nm-install
+      - name: Monorepo build
+        uses: ./.github/actions/run-build
+      - name: Monorepo lint
+        uses: ./.github/actions/run-lints
+      - name: Monorepo unit tests
+        uses: ./.github/actions/run-unit-tests

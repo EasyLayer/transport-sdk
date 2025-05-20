@@ -1,0 +1,26 @@
+name: Analyze Lockfile Workflow
+
+on:
+  pull_request:
+    branches: [master, development]
+    paths-ignore:
+      - 'docs/**'
+      - '**.mdx?'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  analyze-lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Analyze Lockfile Dependencies
+        uses: ./.github/actions/security/lockfile
+        with:
+          path: 'yarn.lock'
+          type: 'yarn'
+          allowedHosts: 'registry.npmjs.org registry.yarnpkg.com'
+          allowedURLs: ''

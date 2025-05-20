@@ -1,0 +1,37 @@
+{
+  "path": "cz-conventional-changelog",
+  "types": {
+    "feat": {
+      "description": "New feature (added functionality per task)",
+      "title": "Added"
+    },
+    "fix": {
+      "description": "Bug fix (addressed an existing issue)",
+      "title": "Fixed"
+    },
+    "infra": {
+      "description": "Infrastructure changes (CI, configuration, scripts)",
+      "title": "Infrastructure"
+    },
+    "refactor": {
+      "description": "Refactor and other changes (documentation, tests, improvements)",
+      "title": "Changed"
+    },
+    "chore":   {
+      "description": "Maintenance tasks (releases, deps updates)",
+      "title": "Chores"
+    },
+    "BREAKING": {
+      "description": "Breaking changes (introduce backward‑incompatible API changes)",
+      "title": "Breaking Changes"
+    }
+  },
+  "scopes": [],
+  "allowCustomScopes": false,
+  "allowBreakingChanges": [
+    "feat",
+    "fix",
+    "infra",
+    "refactor"
+  ]
+}

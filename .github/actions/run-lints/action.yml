@@ -1,0 +1,9 @@
+name: 'Project yarn lint'
+description: 'Run yarn lint to check code style'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 📥 Lint Code
+      shell: bash
+      run: yarn lint

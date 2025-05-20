@@ -1,0 +1,40 @@
+name: 'Prepare Development Branch to Release Flow'
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'patch, minor or major'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/development'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies in current repository
+        uses: ./.github/actions/yarn-nm-install
+
+      - name: Run Prepare Branch Script
+        id: invoke_prepare
+        run: bash ./scripts/prepare-branch-to-release.sh
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HUSKY: '0'
