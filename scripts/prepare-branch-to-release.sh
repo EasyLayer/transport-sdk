@@ -24,10 +24,10 @@ last_release_commit=$(git log --grep="^$RELEASE_COMMIT_PATTERN" -1 --pretty=form
 echo "📝  Generating CHANGELOG.md"
 if [ -z "$last_release_commit" ]; then
   # If no previous release, generate full changelog
-  conventional-changelog -p angular -i CHANGELOG.md -s
+  node_modules/.bin/conventional-changelog -p angular -i CHANGELOG.md -s
 else
   # Generate changelog only for commits since last release
-  conventional-changelog -p angular -i CHANGELOG.md -s --from-git-tag "$last_release_commit"
+  node_modules/.bin/conventional-changelog -p angular -i CHANGELOG.md -s --from-git-tag "$last_release_commit"
 fi
 
 # Generate docs/version_file documentation
