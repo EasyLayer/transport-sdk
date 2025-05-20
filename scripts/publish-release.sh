@@ -5,7 +5,7 @@ set -e
 
 # Publish package with default "latest" tag
 echo "Publishing package with tag: latest"
-./node_modules/.bin/npm publish --no-git-tag-version --yes --force
+npm publish --no-git-tag-version --yes --force
 if [ $? -ne 0 ]; then
     echo "npm publish failed!"
     exit 1
