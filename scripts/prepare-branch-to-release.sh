@@ -8,7 +8,7 @@ version=$VERSION
 
 # Update package version
 echo "Setting package version to: $version"
-./node_modules/.bin/npm version $version --exact --yes --no-git-tag-version --no-commit-hooks --force
+npm version $version --exact --yes --no-git-tag-version --no-commit-hooks --force
 
 # Get the version number from package.json
 version_num=$(jq -r '.version' package.json)
@@ -16,7 +16,7 @@ echo "✨  New version is v$version_num"
 
 # Generate/update CHANGELOG.md according to Conventional Commits
 echo "📝  Generating CHANGELOG.md"
-./node_modules/.bin/conventional-changelog -p angular -i CHANGELOG.md -s
+npm run changelog
 
 # Generate docs/version_file documentation
 DOCS_DIR="docs"
