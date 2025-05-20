@@ -41,8 +41,8 @@ Provides a unified interface for sending requests and subscribing to events over
 
 1. **Clone the repository:**
 ```bash
-git clone https://github.com/easylayer/@transport-sdk.git
-cd @transport-sdk
+git clone https://github.com/easylayer/transport-sdk.git
+cd transport-sdk
 ```
 
 2. **Install dependencies:**
@@ -87,7 +87,7 @@ We welcome contributions! To get started:
 
 ## Issue Reporting
 
-If you encounter a bug or have a feature request related to the `core` repository, please [open an issue](https://github.com/easylayer/@transport-sdk/issues/new/choose) and provide as much detail as possible. For issues related to other EasyLayer projects, please use the appropriate repository.
+If you encounter a bug or have a feature request related to the `core` repository, please [open an issue](https://github.com/easylayer/transport-sdk/issues/new/choose) and provide as much detail as possible. For issues related to other EasyLayer projects, please use the appropriate repository.
 
 ## License
 

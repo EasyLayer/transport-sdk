@@ -22,11 +22,11 @@
     "docs"
   ],
   "bugs": {
-    "url": "https://github.com/easylayer/@transport-sdk/issues"
+    "url": "https://github.com/easylayer/transport-sdk/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git://github.com/easylayer/@transport-sdk.git"
+    "url": "git://github.com/easylayer/transport-sdk.git"
   },
   "scripts": {
     "clear": "yarn run clear:dist && yarn run clear:node_modules && yarn cache clean --all",
