@@ -1,3 +1,13 @@
+## <small>1.0.9 (2025-05-21)</small>
+
+* fix: changelog creation; ([7760a15](https://github.com/easylayer/transport-sdk/commit/7760a15))
+* fix: fixed changelog logic; ([772f5e3](https://github.com/easylayer/transport-sdk/commit/772f5e3))
+* fix: updated changelog creation in the preparing branch flow; ([af75895](https://github.com/easylayer/transport-sdk/commit/af75895))
+* chore(release): release v1.0.8 ([27e0d2c](https://github.com/easylayer/transport-sdk/commit/27e0d2c))
+* chore(release): release v1.0.8 ([b9873ce](https://github.com/easylayer/transport-sdk/commit/b9873ce))
+
+
+
 ## <small>1.0.8 (2025-05-20)</small>
 
 * fix: added release count option to changelog script; ([06773a7](https://github.com/easylayer/transport-sdk/commit/06773a7))
