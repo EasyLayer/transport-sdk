@@ -11,7 +11,7 @@
 ---
 
 <p align="center">
-  <a href="https://easylayer.io">Website</a> | <a href="https://easylayer.io/docs">Docs</a> | <a href="https://github.com/easylayer/website/discussions">Discussions</a>
+  <a href="https://easylayer.io">Website</a> | <a href="https://easylayer.io/docs">Docs</a> | <a href="https://github.com/easylayer/core/discussions">Discussions</a>
 </p>
 
 ---
