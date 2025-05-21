@@ -1,3 +1,15 @@
+## <small>1.0.10 (2025-05-21)</small>
+
+* chore: fixed changelog logic; updated readme; ([3f900fe](https://github.com/easylayer/transport-sdk/commit/3f900fe))
+* chore(release): release v1.0.8 ([27e0d2c](https://github.com/easylayer/transport-sdk/commit/27e0d2c))
+* chore(release): release v1.0.8 ([b9873ce](https://github.com/easylayer/transport-sdk/commit/b9873ce))
+* chore(release): release v1.0.9 ([31094ff](https://github.com/easylayer/transport-sdk/commit/31094ff))
+* fix: changelog creation; ([7760a15](https://github.com/easylayer/transport-sdk/commit/7760a15))
+* fix: fixed changelog logic; ([772f5e3](https://github.com/easylayer/transport-sdk/commit/772f5e3))
+* fix: updated changelog creation in the preparing branch flow; ([af75895](https://github.com/easylayer/transport-sdk/commit/af75895))
+
+
+
 ## <small>1.0.9 (2025-05-21)</small>
 
 * fix: changelog creation; ([7760a15](https://github.com/easylayer/transport-sdk/commit/7760a15))
