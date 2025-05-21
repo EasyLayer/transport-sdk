@@ -39,6 +39,27 @@ jobs:
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Generate Release Notes from CHANGELOG.md
+        id: notes
+        run: |
+          # Get the latest version section from CHANGELOG.md
+          VERSION="${{ env.VERSION }}"
+          CHANGELOG=$(cat CHANGELOG.md)
+
+          # Extract the section for the current version
+          NOTES=$(sed -n "/^${TAG_HEADER}/,/^## <small>/p" CHANGELOG.md \
+                  | sed '1d;$d' \
+                  | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' )
+
+          if [ -z "$NOTES" ]; then
+            echo "❌  Could not find changelog section for ${VERSION}"
+            exit 1
+          fi
+          
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Publish Release Packages
         id: publish_release_packages
