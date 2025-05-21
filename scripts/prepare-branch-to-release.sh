@@ -3,9 +3,6 @@
 # Stop the script on errors
 set -e
 
-# Constants
-RELEASE_COMMIT_PATTERN="chore(release):"
-
 # Get version type (e.g., patch, minor or major)
 version=$VERSION
 
@@ -73,7 +70,7 @@ git add \
 
 # Only commit if there are staged changes
 if ! git diff --cached --quiet; then
-  git commit -m "$RELEASE_COMMIT_PATTERN release v$version_num"
+  git commit -m "release v$version_num"
   git push origin HEAD
 else
   echo "⚠️  No changes to commit"
