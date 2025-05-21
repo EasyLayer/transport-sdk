@@ -9,6 +9,34 @@ RELEASE_COMMIT_PATTERN="chore(release):"
 # Get version type (e.g., patch, minor or major)
 version=$VERSION
 
+# ────────────────────────────────────────────────────────────────────────────────
+# generate_changelog
+#
+# 1. Fetch all tags and update refs.
+# 2. Determine the latest semantic version tag (vX.Y.Z).
+# 3a. If no tag is found, generate the full changelog (-r 0).
+# 3b. Otherwise, generate only the next release section (-r 1).
+# ────────────────────────────────────────────────────────────────────────────────
+generate_changelog() {
+  # Fetch the latest commits and tags from main, then merge into current branch
+  git fetch origin master --tags
+  git merge --no-ff origin/master --no-edit
+
+  # Retrieve the latest semantic version tag
+  local latest_tag
+  latest_tag=$(git tag --list --sort=-version:refname | head -n1)
+
+  if [ -z "$latest_tag" ]; then
+    echo "📝  No tags found. Generating full CHANGELOG…"
+    node_modules/.bin/conventional-changelog -p angular -i CHANGELOG.md -s -r 0
+  else
+    echo "📝  Latest tag is $latest_tag — generating only the next release…"
+    node_modules/.bin/conventional-changelog -p angular -i CHANGELOG.md -s -r 1
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────────────────────
+
 # Update package version
 echo "Setting package version to: $version"
 npm version $version --exact --yes --no-git-tag-version --no-commit-hooks --force
@@ -17,18 +45,9 @@ npm version $version --exact --yes --no-git-tag-version --no-commit-hooks --forc
 version_num=$(jq -r '.version' package.json)
 echo "✨  New version is v$version_num"
 
-# Get the last release commit
-last_release_commit=$(git log --grep="^$RELEASE_COMMIT_PATTERN" -1 --pretty=format:"%H")
-
-# Generate/update CHANGELOG.md according to Conventional Commits
+# Generate or update CHANGELOG.md in one call
 echo "📝  Generating CHANGELOG.md"
-if [ -z "$last_release_commit" ]; then
-  # If no previous release, generate full changelog
-  node_modules/.bin/conventional-changelog -p angular -i CHANGELOG.md -s
-else
-  # Generate changelog only for commits since last release
-  node_modules/.bin/conventional-changelog -p angular -i CHANGELOG.md -s --from-git-tag "$last_release_commit"
-fi
+generate_changelog
 
 # Generate docs/version_file documentation
 DOCS_DIR="docs"
