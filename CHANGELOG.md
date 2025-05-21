@@ -1,3 +1,9 @@
+## <small>1.0.12 (2025-05-21)</small>
+
+* chore: fixed workflow changelog pipeline; ([411f62e](https://github.com/easylayer/transport-sdk/commit/411f62e))
+
+
+
 ## <small>1.0.11 (2025-05-21)</small>
 
 * chore: fixed prepare script; ([025a827](https://github.com/easylayer/transport-sdk/commit/025a827))
