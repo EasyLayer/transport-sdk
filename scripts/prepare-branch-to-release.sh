@@ -6,6 +6,9 @@ set -e
 # Get version type (e.g., patch, minor or major)
 version=$VERSION
 
+git config user.name "github-actions"
+git config user.email "github-actions@github.com"
+
 # ────────────────────────────────────────────────────────────────────────────────
 # generate_changelog
 #
@@ -60,8 +63,6 @@ echo "📄  Copied $DOCS_SRC to $DOCS_DEST"
 
 # Commit all changes in a single commit (version bump, CHANGELOG, docs)
 echo "🚀  Committing all changes"
-git config user.name "github-actions"
-git config user.email "github-actions@github.com"
 git add \
   package.json \
   yarn.lock \

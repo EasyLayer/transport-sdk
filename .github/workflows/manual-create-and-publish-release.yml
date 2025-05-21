@@ -39,27 +39,6 @@ jobs:
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Generate Release Notes from CHANGELOG.md
-        id: notes
-        run: |
-          # Get the latest version section from CHANGELOG.md
-          VERSION="v${{ env.VERSION }}"
-          CHANGELOG=$(cat CHANGELOG.md)
-          
-          # Extract the section for the current version
-          if [[ $CHANGELOG =~ "## <small>$VERSION"([^#]*) ]]; then
-            NOTES="${BASH_REMATCH[1]}"
-            # Remove leading/trailing whitespace and empty lines
-            NOTES=$(echo "$NOTES" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d')
-          else
-            echo "Could not find version $VERSION in CHANGELOG.md"
-            exit 1
-          fi
-          
-          echo "body<<EOF" >> $GITHUB_OUTPUT
-          echo "$NOTES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Publish Release Packages
         id: publish_release_packages
