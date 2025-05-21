@@ -126,8 +126,4 @@
 * feat: base implementation; ([03ef2d7](https://github.com/easylayer/transport-sdk/commit/03ef2d7))
 
 
-
-# Changelog
-
-
 ## [Unreleased]
