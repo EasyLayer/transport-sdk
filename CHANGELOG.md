@@ -1,3 +1,10 @@
+## <small>1.0.11 (2025-05-21)</small>
+
+* chore: fixed prepare script; ([025a827](https://github.com/easylayer/transport-sdk/commit/025a827))
+* chore: removed changelog logic from release workflow; ([8919536](https://github.com/easylayer/transport-sdk/commit/8919536))
+
+
+
 ## <small>1.0.10 (2025-05-21)</small>
 
 * chore: fixed changelog logic; updated readme; ([3f900fe](https://github.com/easylayer/transport-sdk/commit/3f900fe))
