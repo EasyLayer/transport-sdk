@@ -45,7 +45,7 @@ jobs:
         run: |
           # Get the latest version section from CHANGELOG.md
           VERSION="${{ env.VERSION }}"
-          CHANGELOG=$(cat CHANGELOG.md)
+          TAG_HEADER="## <small>${VERSION} " 
 
           # Extract the section for the current version
           NOTES=$(sed -n "/^${TAG_HEADER}/,/^## <small>/p" CHANGELOG.md \

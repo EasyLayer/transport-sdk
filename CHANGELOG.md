@@ -1,3 +1,9 @@
+## <small>1.0.13 (2025-05-21)</small>
+
+* chore: updated changelog flow; ([f20fd9d](https://github.com/easylayer/transport-sdk/commit/f20fd9d))
+
+
+
 ## <small>1.0.12 (2025-05-21)</small>
 
 * chore: fixed workflow changelog pipeline; ([411f62e](https://github.com/easylayer/transport-sdk/commit/411f62e))
@@ -124,10 +130,6 @@
 * refactor: updated readme; ([677ce6c](https://github.com/easylayer/transport-sdk/commit/677ce6c))
 * refactor: updated repo urls; ([e495d0e](https://github.com/easylayer/transport-sdk/commit/e495d0e))
 * feat: base implementation; ([03ef2d7](https://github.com/easylayer/transport-sdk/commit/03ef2d7))
-
-
-
-# Changelog
 
 
 ## [Unreleased]
