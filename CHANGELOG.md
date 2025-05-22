@@ -1,3 +1,9 @@
+## <small>1.0.14 (2025-05-22)</small>
+
+* chore: removed postinstall script; ([0331741](https://github.com/easylayer/transport-sdk/commit/0331741))
+
+
+
 ## <small>1.0.13 (2025-05-21)</small>
 
 * chore: updated changelog flow; ([f20fd9d](https://github.com/easylayer/transport-sdk/commit/f20fd9d))
