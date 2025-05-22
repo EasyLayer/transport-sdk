@@ -19,7 +19,8 @@
   },
   "files": [
     "dist",
-    "docs"
+    "docs",
+    "LICENSE"
   ],
   "bugs": {
     "url": "https://github.com/easylayer/transport-sdk/issues"
