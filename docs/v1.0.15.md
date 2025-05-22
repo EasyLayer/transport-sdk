@@ -1,14 +1,14 @@
 # EasyLayer Transport SDK
 
 A lightweight SDK for easy client-side integration with EasyLayer-based applications. 
-Provides a unified interface for sending requests and subscribing to events over different transport protocols (HTTP, IPC). 
+Provides a unified interface for sending requests and subscribing to events over different transport protocols (RPC, IPC). 
 Designed for seamless communication with our apps.
 
 This document contains:
 
 - [Setup](#setup)
 - [Transport API Reference](#transport-api-reference)
-  - [HTTP](#http)
+  - [RPC](#rpc)
   - [IPC (Node.js Child Process)](#ipc-nodejs-child-process)
   - [WebSocket (WS)](#websocket-ws-planned)
   - [TCP](#tcp-planned)
@@ -34,7 +34,7 @@ import { Client } from '@easylayer/transport-sdk';
 
 const client = new Client({
   transport: {
-    type: 'http',
+    type: 'rpc',
     baseUrl: 'http://localhost:3000',
   },
 });
@@ -60,17 +60,17 @@ const unsubscribe = client.subscribe('Your_Event_Name', async (event) => {
 ## Transport API Reference
 
 <details>
-<summary><strong>HTTP</strong></summary>
+<summary><strong>RPC</strong></summary>
 
 #### Overview
-HTTP transport is used for request-response communication with our apps.  
+RPC transport is used for request-response communication with our apps.  
 All requests are sent as HTTP POST with a unified message envelope.
 
 #### Configuration Example
 ```ts
 const client = new Client({
   transport: {
-    type: 'http',
+    type: 'rpc',
     baseUrl: 'http://localhost:3000'
   },
 });
@@ -96,7 +96,7 @@ TODO
 
 #### API Methods
 - `client.request(action, requestId, payload)` — Send a request and await response.
-- `client.subscribe(constructorName, callback)` — Not supported for HTTP (will throw or be a no-op).
+- `client.subscribe(constructorName, callback)` — Not supported for RPC (will throw or be a no-op).
 
 </details>
 

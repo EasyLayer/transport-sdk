@@ -4,20 +4,20 @@ import type { Message } from '../core/transport';
 import { BaseTransport } from '../core/transport';
 
 /**
- * HTTP-based transport.
+ * RPC-based transport.
  */
-export interface HttpTransportOptions {
-  type: 'http';
+export interface RpcTransportOptions {
+  type: 'rpc';
   baseUrl: string;
   name?: string;
   headers?: Record<string, string>;
 }
 
-export class HttpTransport extends BaseTransport {
+export class RpcTransport extends BaseTransport {
   private readonly axiosInstance: AxiosInstance;
 
-  constructor(options: HttpTransportOptions) {
-    super('http', options.name ?? 'http');
+  constructor(options: RpcTransportOptions) {
+    super('rpc', options.name ?? 'rpc');
     // ensure no trailing slash
     this.axiosInstance = axios.create({
       baseURL: options.baseUrl.replace(/\/$/, ''),
@@ -29,19 +29,19 @@ export class HttpTransport extends BaseTransport {
   /** Fire-and-forget: POST the message. */
   protected async forward(message: Message): Promise<void> {
     await this.axiosInstance.post('', message).catch((err) => {
-      throw new Error(`HTTP forward error: ${err}`);
+      throw new Error(`RPC forward error: ${err}`);
     });
   }
 
-  /** Send + wait for HTTP response body. */
+  /** Send + wait for RPC response body. */
   protected async transmit(message: Message): Promise<any> {
     const response = await this.axiosInstance.post('', message).catch((err) => {
-      throw new Error(`HTTP transmit error: ${err}`);
+      throw new Error(`RPC transmit error: ${err}`);
     });
     return response.data;
   }
 
-  /** Nothing special to clean up for HTTP. */
+  /** Nothing special to clean up for RPC. */
   async destroy(): Promise<void> {
     /* no-op */
   }

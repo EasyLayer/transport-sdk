@@ -74,7 +74,7 @@ export default [
     },
   },
   {
-    files: ['**/check-docs.ts', '**/http.transport.ts'],
+    files: ['**/check-docs.ts', '**/rpc.transport.ts'],
     rules: {
       'no-restricted-syntax': 'off',
     },

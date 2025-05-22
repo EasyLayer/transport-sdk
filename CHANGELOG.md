@@ -1,3 +1,10 @@
+## <small>1.0.15 (2025-05-22)</small>
+
+* chore: added license file into npm package; ([641807b](https://github.com/easylayer/transport-sdk/commit/641807b))
+* chore: chnage http naming for rpc; ([358a7a4](https://github.com/easylayer/transport-sdk/commit/358a7a4))
+
+
+
 ## <small>1.0.14 (2025-05-22)</small>
 
 * chore: removed postinstall script; ([0331741](https://github.com/easylayer/transport-sdk/commit/0331741))

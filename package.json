@@ -1,6 +1,6 @@
 {
   "name": "@easylayer/transport-sdk",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "description": "A lightweight SDK for easy client-side integration with EasyLayer applications",
   "author": "Yaroslav Pavliuk",
   "license": "MIT",
@@ -19,7 +19,8 @@
   },
   "files": [
     "dist",
-    "docs"
+    "docs",
+    "LICENSE"
   ],
   "bugs": {
     "url": "https://github.com/easylayer/transport-sdk/issues"
