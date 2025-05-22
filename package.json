@@ -40,7 +40,7 @@
     "lint": "eslint -c eslint.config.mjs \"src/**/*.ts\"",
     "lint:fix": "eslint -c eslint.config.mjs \"src/**/*.ts\" --fix",
     "format": "prettier -с prettier.config.mjs --write \"src/**/*.ts\"",
-    "postinstall": "husky install",
+    "prepare": "husky install",
     "pre-commit": "yarn run lint && ts-node src/scripts/check-docs.ts",
     "pre-push": "yarn run test:unit",
     "commit": "cz",
