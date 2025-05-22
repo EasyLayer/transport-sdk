@@ -1,10 +1,10 @@
-import type { HttpTransportOptions } from '../transports/http.transport';
-import { HttpTransport } from '../transports/http.transport';
+import type { RpcTransportOptions } from '../transports/rpc.transport';
+import { RpcTransport } from '../transports/rpc.transport';
 import type { IpcTransportOptions } from '../transports/ipc.transport';
 import { IpcTransport } from '../transports/ipc.transport';
 import type { ITransport } from './transport';
 
-export type TransportOptions = HttpTransportOptions | IpcTransportOptions;
+export type TransportOptions = RpcTransportOptions | IpcTransportOptions;
 
 /**
  * Factory for creating the correct transport implementation.
@@ -12,8 +12,8 @@ export type TransportOptions = HttpTransportOptions | IpcTransportOptions;
 export class TransportFactory {
   static create(options: TransportOptions): ITransport {
     switch (options.type) {
-      case 'http':
-        return new HttpTransport(options);
+      case 'rpc':
+        return new RpcTransport(options);
       case 'ipc':
         return new IpcTransport(options);
       default:

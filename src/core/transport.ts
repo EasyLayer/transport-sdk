@@ -27,7 +27,7 @@ export type OutgoingAction = 'query' | 'pong';
 export type IncomingAction = 'queryResponse' | 'ping' | 'error' | 'event' | 'batch';
 
 /** Supported transport protocols. */
-export type TransportType = 'http' | 'ipc';
+export type TransportType = 'rpc' | 'ipc';
 
 /**
  * Core transport interface: send-only,

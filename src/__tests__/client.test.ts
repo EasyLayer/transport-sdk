@@ -25,7 +25,7 @@ describe('Client', () => {
     // Setup client options
     options = {
       transport: {
-        type: 'http',
+        type: 'rpc',
         baseUrl: 'http://localhost:3000',
       },
     };

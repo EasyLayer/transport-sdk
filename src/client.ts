@@ -6,7 +6,7 @@ import type { ITransport, Payload, OutgoingAction, Message } from './core/transp
  * ClientOptions passed to the SDK.
  */
 export interface ClientOptions {
-  /** Transport configuration (e.g. HTTP or IPC). */
+  /** Transport configuration (e.g. RPC or IPC). */
   transport: TransportOptions;
 }
 

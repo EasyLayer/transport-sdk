@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { HttpTransport } from '../transports/http.transport';
+import { RpcTransport } from '../transports/rpc.transport';
 import { Message } from '../core/transport';
 
 const mockAxiosInstance = {
@@ -10,8 +10,8 @@ jest.mock('axios', () => ({
   create: jest.fn(() => mockAxiosInstance)
 }));
 
-describe('HttpTransport', () => {
-  let transport: HttpTransport;
+describe('RpcTransport', () => {
+  let transport: RpcTransport;
   const testUrl = 'http://localhost:3000';
   const testMessage: Message = {
     action: 'query',
@@ -23,7 +23,7 @@ describe('HttpTransport', () => {
   };
 
   beforeEach(() => {
-    transport = new HttpTransport({ type: 'http', baseUrl: testUrl });
+    transport = new RpcTransport({ type: 'rpc', baseUrl: testUrl });
     jest.clearAllMocks();
   });
 
@@ -43,7 +43,7 @@ describe('HttpTransport', () => {
 
       await expect(transport.sendAndAwait(testMessage))
         .rejects
-        .toThrow('HTTP transmit error: Error: Network error');
+        .toThrow('RPC transmit error: Error: Network error');
     });
   });
 
