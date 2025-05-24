@@ -116,14 +116,14 @@ export class IpcTransport extends BaseTransport {
     }
     if (action === 'event') {
       this.handleMessage({ action, payload, requestId }).catch((err) =>
-        console.error('[IpcTransport] event handler error', err)
+        console.error('[IpcTransport] event subscriber error', err)
       );
       return;
     }
 
     if (action === 'batch') {
       this.handleMessage({ action, payload, requestId }).catch((err) =>
-        console.error('[IpcTransport] batch handler error', err)
+        console.error('[IpcTransport] batch subscriber error', err)
       );
       return;
     }

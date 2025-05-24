@@ -18,8 +18,8 @@
 
 # EasyLayer Transport SDK
 
-A lightweight, universal SDK for integrating any client (Node.js, browser, or service) with EasyLayer-based applications. 
-Provides a unified interface for sending requests and subscribing to events over different transport protocols (HTTP, IPC). 
+A lightweight, universal SDK for communicating with EasyLayer-based applications. 
+Provides a unified interface for sending requests and subscribing to events over different transport protocols (RPC, IPC). 
 - Sending typed requests to your easylayer app
 - Subscribing to custom events
 - Switching transports without changing your business logic
