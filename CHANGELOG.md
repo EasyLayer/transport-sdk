@@ -1,3 +1,9 @@
+## <small>1.0.16 (2025-05-24)</small>
+
+* infra: added task template into github workflows; ([b54a773](https://github.com/easylayer/transport-sdk/commit/b54a773))
+
+
+
 ## <small>1.0.15 (2025-05-22)</small>
 
 * chore: added license file into npm package; ([641807b](https://github.com/easylayer/transport-sdk/commit/641807b))
