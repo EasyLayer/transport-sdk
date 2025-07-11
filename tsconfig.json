@@ -13,7 +13,13 @@
     "isolatedModules": true,
     "noUncheckedIndexedAccess": true,
     "esModuleInterop": true,
-    "allowSyntheticDefaultImports": true
+    "allowSyntheticDefaultImports": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "baseUrl": ".",
+    "paths": {
+      "@easylayer/transport-sdk/*": ["./src"]
+    }
   },
   "references": [],
   "include": ["src"],

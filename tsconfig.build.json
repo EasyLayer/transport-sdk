@@ -13,6 +13,7 @@
   "include": ["src"],
   "exclude": [
     "scripts",
+    "e2e-tests",
     "dist",
     "node_modules",
     "**/*.test.ts",

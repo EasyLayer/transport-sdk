@@ -1,9 +1,0 @@
-name: 'Project yarn test:unit'
-description: 'Run yarn test:unit to execute unit tests'
-
-runs:
-  using: 'composite'
-  steps:
-    - name: 📥 Run Unit Tests
-      run: yarn test:unit
-      shell: bash

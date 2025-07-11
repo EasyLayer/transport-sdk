@@ -1,21 +1,11 @@
 # EasyLayer Transport SDK
 
-A lightweight SDK for easy client-side integration with EasyLayer-based applications. 
-Provides a unified interface for sending requests and subscribing to events over different transport protocols (RPC, IPC). 
+A lightweight SDK for easy client-side integration with EasyLayer-based applications.
+Provides a unified interface for sending queries and subscribing to events over different transport protocols (HTTP, WebSocket, IPC).
 Designed for seamless communication with our apps.
-
-This document contains:
-
-- [Setup](#setup)
-- [Transport API Reference](#transport-api-reference)
-  - [RPC](#rpc)
-  - [IPC (Node.js Child Process)](#ipc-nodejs-child-process)
-  - [WebSocket (WS)](#websocket-ws-planned)
-  - [TCP](#tcp-planned)
 
 ---
 
-<!-- SETUP-START -->
 ## Setup
 
 Make sure you have [Node.js](https://nodejs.org/) (version >= 16) installed.
@@ -34,44 +24,124 @@ import { Client } from '@easylayer/transport-sdk';
 
 const client = new Client({
   transport: {
-    type: 'rpc',
+    type: 'http',
     baseUrl: 'http://localhost:3000',
   },
 });
 
-const response = await client.request('query', 'generated_requestId', {
-  constructorName: 'Query_Name',
+// Execute a query
+const response = await client.query('generated_requestId', {
+  constructorName: 'GetUserQuery',
   dto: {
-    modelIds: ['your_model_id'],
+    userId: 'user123',
   },
 });
 
+// Execute a streaming query (for supported transports)
+for await (const item of client.streamQuery('stream_requestId', {
+  constructorName: 'StreamDataQuery',
+  dto: { limit: 100 },
+})) {
+  console.log('Stream item:', item);
+}
+
 // Subscribe to events (if supported by transport)
-const unsubscribe = client.subscribe('Your_Event_Name', async (event) => {
-  console.log('Received event:', event);
+const unsubscribe = client.subscribe('UserCreatedEvent', async (event) => {
+  console.log('User created:', event);
 });
+
+// Check connection status
+console.log('Connected:', client.isConnected());
+
+// Cleanup
+await client.destroy();
 ```
-<!-- SETUP-END -->
+
+### NestJS Integration
+
+The SDK can be used as a NestJS module:
+
+```ts
+import { ClientModule } from '@easylayer/transport-sdk';
+
+@Module({
+  imports: [
+    ClientModule.forRoot({
+      isGlobal: true,
+      transport: {
+        type: 'http',
+        baseUrl: 'http://localhost:3000',
+      },
+    }),
+  ],
+})
+export class AppModule {}
+
+// Or async configuration
+@Module({
+  imports: [
+    ClientModule.forRootAsync({
+      isGlobal: true,
+      useFactory: (configService: ConfigService) => ({
+        transport: {
+          type: 'http',
+          baseUrl: configService.get('API_URL'),
+        },
+      }),
+      inject: [ConfigService],
+    }),
+  ],
+})
+export class AppModule {}
+
+// Usage in service
+@Injectable()
+export class UserService {
+  constructor(private readonly client: Client) {}
+
+  async getUser(userId: string) {
+    return this.client.query('req-' + Date.now(), {
+      constructorName: 'GetUserQuery',
+      dto: { userId },
+    });
+  }
+}
+```
 
 ---
 
-<!-- TRANSPORT-API-REFERENCE-START -->
-
 ## Transport API Reference
 
-<details>
-<summary><strong>RPC</strong></summary>
+### HTTP Transport
 
 #### Overview
-RPC transport is used for request-response communication with our apps.  
+HTTP transport is used for traditional request-response communication with EasyLayer apps.
 All requests are sent as HTTP POST with a unified message envelope.
+
+#### Configuration Options
+```ts
+interface HttpClientOptions {
+  type: 'http';
+  baseUrl: string;           // Required: Base URL of the server
+  headers?: Record<string, string>; // Optional: Custom headers
+  maxMessageSize?: number;   // Optional: Max message size (default: 100MB)
+  timeout?: number;          // Optional: Request timeout (default: 30s)
+  name?: string;            // Optional: Transport name for debugging
+}
+```
 
 #### Configuration Example
 ```ts
 const client = new Client({
   transport: {
-    type: 'rpc',
-    baseUrl: 'http://localhost:3000'
+    type: 'http',
+    baseUrl: 'http://localhost:3000',
+    headers: {
+      'Authorization': 'Bearer token123',
+      'X-API-Version': '1.0',
+    },
+    timeout: 10000, // 10 seconds
+    maxMessageSize: 50 * 1024 * 1024, // 50MB
   },
 });
 ```
@@ -83,52 +153,12 @@ All requests are sent as POST to the base URL with the following JSON body:
   "action": "query",
   "requestId": "generated_requestId",
   "payload": {
-    "constructorName": "Query_Name",
+    "constructorName": "GetUserQuery",
     "dto": {
-      "modelIds": ["your_model_id"]
+      "userId": "user123"
     }
-  }
-}
-```
-
-#### Response Format
-TODO
-
-#### API Methods
-- `client.request(action, requestId, payload)` — Send a request and await response.
-- `client.subscribe(constructorName, callback)` — Not supported for RPC (will throw or be a no-op).
-
-</details>
-
-<details>
-<summary><strong>IPC (Node.js Child Process)</strong></summary>
-
-#### Overview
-IPC transport is used for communication between Node.js processes (e.g., parent and child only).
-
-#### Configuration Example
-```ts
-import { fork } from 'child_process';
-const child = fork('path/to/easylayer_app');
-
-const client = new Client({
-  transport: {
-    type: 'ipc',
-    child,
   },
-});
-```
-
-#### Message Format
-Messages are sent as JSON objects:
-```json
-{
-  "action": "query",
-  "requestId": "generated_requestId",
-  "payload": {
-    "constructorName": "Query_Name",
-    "dto": { "modelIds": ["your_model_id"] }
-  }
+  "timestamp": 1640995200000
 }
 ```
 
@@ -136,27 +166,173 @@ Messages are sent as JSON objects:
 ```json
 {
   "action": "queryResponse",
+  "requestId": "generated_requestId", 
+  "payload": {
+    "id": "user123",
+    "name": "John Doe",
+    "email": "john@example.com"
+  },
+  "timestamp": 1640995201000
+}
+```
+
+#### Streaming Support
+For streaming queries, requests are sent to `/stream` endpoint and responses are returned as NDJSON:
+```
+{"action":"streamResponse","payload":{"index":0,"data":"item1"}}
+{"action":"streamResponse","payload":{"index":1,"data":"item2"}}
+{"action":"streamEnd","payload":null}
+```
+
+#### API Methods
+- `client.query(requestId, payload)` — Send a query and await response
+- `client.streamQuery(requestId, payload)` — Execute streaming query
+- `client.subscribe(constructorName, callback)` — Not supported for HTTP
+- `client.isConnected()` — Always returns `true` for HTTP
+
+### WebSocket Transport
+
+#### Overview
+WebSocket transport provides real-time bidirectional communication with EasyLayer apps.
+Supports queries, streaming, and event subscriptions.
+
+#### Configuration Options
+```ts
+interface WsClientOptions {
+  type: 'ws';
+  url: string;              // Required: WebSocket server URL
+  path?: string;            // Optional: Socket.IO path (default: '/socket.io')
+  maxMessageSize?: number;  // Optional: Max message size (default: 10MB)
+  connectionTimeout?: number; // Optional: Connection timeout (default: 8s)
+  timeout?: number;         // Optional: Request timeout (default: 30s)
+  name?: string;           // Optional: Transport name for debugging
+}
+```
+
+#### Configuration Example
+```ts
+const client = new Client({
+  transport: {
+    type: 'ws',
+    url: 'http://localhost:3001',
+    path: '/socket.io',
+    connectionTimeout: 5000,
+    maxMessageSize: 5 * 1024 * 1024, // 5MB
+  },
+});
+```
+
+#### Message Format
+Messages are sent over WebSocket connection:
+```json
+{
+  "action": "query",
   "requestId": "generated_requestId",
-  "payload": { /* response data */ }
+  "payload": {
+    "constructorName": "GetUserQuery",
+    "dto": { "userId": "user123" }
+  },
+  "timestamp": 1640995200000
+}
+```
+
+#### Event Subscription
+```ts
+// Subscribe to events
+const unsubscribe = client.subscribe('UserCreatedEvent', async (event) => {
+  console.log('New user:', event);
+});
+
+// Unsubscribe
+unsubscribe();
+```
+
+#### API Methods
+- `client.query(requestId, payload)` — Send a query and await response
+- `client.streamQuery(requestId, payload)` — Execute streaming query  
+- `client.subscribe(constructorName, callback)` — Subscribe to events
+- `client.isConnected()` — Check if WebSocket is connected
+- `client.getSubscriptionCount(constructorName)` — Get subscription count
+- `client.getActiveSubscriptions()` — Get all active subscriptions
+
+### IPC Transport (Node.js)
+
+#### Overview
+IPC transport is used for communication between Node.js processes (parent and child).
+Ideal for microservices architectures and process isolation.
+
+#### Configuration Options
+```ts
+interface IpcClientOptions {
+  type: 'ipc';
+  child: ChildProcess;       // Required: Child process instance
+  heartbeatTimeout?: number; // Optional: Heartbeat timeout (default: 30s)
+  maxMessageSize?: number;   // Optional: Max message size (default: 1MB)
+  connectionTimeout?: number; // Optional: Connection timeout (default: 5s)
+  timeout?: number;          // Optional: Request timeout (default: 30s)
+  name?: string;            // Optional: Transport name for debugging
+}
+```
+
+#### Configuration Example
+```ts
+import { fork } from 'child_process';
+
+const child = fork('path/to/easylayer_app.js');
+const client = new Client({
+  transport: {
+    type: 'ipc',
+    child,
+    heartbeatTimeout: 10000,
+    connectionTimeout: 3000,
+  },
+});
+```
+
+#### Message Format
+Messages are sent as JSON objects through IPC:
+```json
+{
+  "action": "query",
+  "correlationId": "generated_correlation_id",
+  "payload": {
+    "constructorName": "GetUserQuery", 
+    "dto": { "userId": "user123" }
+  },
+  "timestamp": 1640995200000
+}
+```
+
+#### Response Format
+```json
+{
+  "action": "queryResponse",
+  "correlationId": "generated_correlation_id",
+  "payload": {
+    "id": "user123",
+    "name": "John Doe"
+  },
+  "timestamp": 1640995201000
 }
 ```
 
 #### API Methods
-- `client.request(action, requestId, payload)` — Send a request and await response.
-- `client.subscribe(constructorName, callback)` — Subscribe to events of a given type (event-driven).
+- `client.query(requestId, payload)` — Send a query and await response
+- `client.streamQuery(requestId, payload)` — Execute streaming query
+- `client.subscribe(constructorName, callback)` — Subscribe to events
+- `client.isConnected()` — Check if IPC channel is connected
+- `client.getSubscriptionCount(constructorName)` — Get subscription count
+- `client.getActiveSubscriptions()` — Get all active subscriptions
 
-</details>
+---
 
-<details>
-<summary><strong>WebSocket (WS)</strong> <em>(planned)</em></summary>
+## Error Handling
 
-_Not yet implemented in this SDK. Planned for future releases._
-</details>
+### Error Types
 
-<details>
-<summary><strong>TCP</strong> <em>(planned)</em></summary>
-
-_Not yet implemented in this SDK. Planned for future releases._
-</details>
-
-<!-- TRANSPORT-API-REFERENCE-END -->
+- **ConnectionError** — Network or connection issues
+- **TimeoutError** — Request or connection timeouts  
+- **MessageError** — Invalid messages or server errors
+- **TransportInitError** — Transport configuration errors
+- **MessageSizeError** — Message size limit exceeded
+- **SubscriptionError** — Event subscription errors
