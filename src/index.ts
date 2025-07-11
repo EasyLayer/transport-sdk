@@ -1,2 +1,3 @@
-export { Client } from './client';
-export type { ClientOptions } from './client';
+export * from './client';
+export * from './client.module';
+export * from './shared';

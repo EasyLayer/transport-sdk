@@ -1,3 +1,9 @@
+## 1.1.0 (2025-07-11)
+
+* BREAKING: refactored transports; removed tcp; added e2e tests; ([b0410ed](https://github.com/easylayer/transport-sdk/commit/b0410ed))
+
+
+
 ## <small>1.0.16 (2025-05-24)</small>
 
 * infra: added task template into github workflows; ([b54a773](https://github.com/easylayer/transport-sdk/commit/b54a773))

@@ -1,0 +1,9 @@
+name: 'Project yarn test'
+description: 'Run yarn test to execute all tests'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 📥 Run All Tests
+      run: yarn test
+      shell: bash

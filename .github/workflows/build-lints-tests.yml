@@ -1,4 +1,4 @@
-name: Build-Lints-Unit Tests Workflow
+name: Build-Lints-Tests Workflow
 
 on:
   pull_request:
@@ -29,5 +29,5 @@ jobs:
         uses: ./.github/actions/run-build
       - name: Monorepo lint
         uses: ./.github/actions/run-lints
-      - name: Monorepo unit tests
-        uses: ./.github/actions/run-unit-tests
+      - name: Monorepo all tests
+        uses: ./.github/actions/run-tests

@@ -1,69 +1,118 @@
-import type { TransportOptions } from './core/factory';
+import type { ClientTransportOptions } from './core/factory';
 import { TransportFactory } from './core/factory';
-import type { ITransport, Payload, OutgoingAction, Message } from './core/transport';
+import { MessageError } from './shared';
+import type { ITransport, BasePayload, IncomingMessage } from './shared';
 
-/**
- * ClientOptions passed to the SDK.
- */
 export interface ClientOptions {
-  /** Transport configuration (e.g. RPC or IPC). */
-  transport: TransportOptions;
+  transport: ClientTransportOptions;
 }
 
-/**
- * Main SDK entry point.
- */
 export class Client {
   private _transport: ITransport;
 
-  /**
-   * Initializes the client and its underlying transport.
-   * @param options Configuration including transport type/options.
-   */
   constructor(options: ClientOptions) {
     this._transport = TransportFactory.create(options.transport);
 
-    // Ensure graceful shutdown
-    const shutdown = () => this._transport.destroy().catch(console.error);
+    // Setup graceful shutdown
+    const shutdown = () =>
+      this._transport.destroy().catch(() => {
+        // Silently handle shutdown errors
+      });
+
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
   }
 
-  /** Expose the raw transport for advanced use. */
   get transport(): ITransport {
     return this._transport;
   }
 
   /**
-   * Sends a request and awaits its response.
-   * @param action Must be 'query' for now.
-   * @param requestId Unique identifier for correlation.
-   * @param payload Arbitrary payload data.
-   * @returns The deserialized response of type T.
+   * Execute a query and wait for response
    */
-  async request<T = any>(action: OutgoingAction, requestId: string, payload: Payload): Promise<T> {
+  public async query<T = any>(requestId: string, payload: BasePayload): Promise<T> {
     if (!requestId) {
-      throw new Error('requestId is required.');
+      throw new MessageError('requestId is required', {
+        transportType: this.transport.type,
+        transportName: this.transport.name,
+        context: { payload },
+      });
     }
 
-    switch (action) {
-      case 'query': {
-        const message: Message = { action, requestId, payload };
-        return await this.transport.sendAndAwait<T>(message);
+    const message: IncomingMessage = {
+      action: 'query',
+      requestId,
+      payload,
+      timestamp: Date.now(),
+    };
+
+    return await this.transport.sendAndAwait<T>(message);
+  }
+
+  /**
+   * Execute a streaming query (for transports that support it)
+   */
+  public async *streamQuery<T = any>(requestId: string, payload: BasePayload): AsyncGenerator<T, void, unknown> {
+    if (!requestId) {
+      throw new MessageError('requestId is required', {
+        transportType: this.transport.type,
+        transportName: this.transport.name,
+        context: { payload },
+      });
+    }
+
+    const message: IncomingMessage = {
+      action: 'streamQuery',
+      requestId,
+      payload,
+      timestamp: Date.now(),
+    };
+
+    // For streaming, we need to handle multiple responses
+    const result = await this.transport.sendAndAwait<T[] | T>(message);
+
+    // Convert array to async generator
+    if (Array.isArray(result)) {
+      for (const item of result) {
+        yield item;
       }
-      default: {
-        throw new Error(`Unsupported action: ${action}`);
-      }
+    } else {
+      yield result;
     }
   }
 
   /**
-   * Subscribe to messages of a given type.
-   * @param constructorName The message type key to listen for.
-   * @param cb Async callback invoked for each message.
-   * @returns Unsubscribe function.
+   * Subscribe to events by constructor name
    */
-  subscribe<T = any>(constructorName: string, cb: (event: T) => Promise<void>): () => void {
+  public subscribe<T = any>(constructorName: string, cb: (event: T) => Promise<void>): () => void {
     return this.transport.subscribe(constructorName, cb);
+  }
+
+  /**
+   * Check if transport is connected
+   */
+  public isConnected(): boolean {
+    return this.transport.isConnected();
+  }
+
+  /**
+   * Get number of active subscriptions for a specific event type
+   */
+  public getSubscriptionCount(constructorName: string): number {
+    return this.transport.getSubscriptionCount(constructorName);
+  }
+
+  /**
+   * Get all active subscription names
+   */
+  public getActiveSubscriptions(): string[] {
+    return this.transport.getActiveSubscriptions();
+  }
+
+  /**
+   * Destroy the client and cleanup resources
+   */
+  public async destroy(): Promise<void> {
+    await this.transport.destroy();
   }
 }
