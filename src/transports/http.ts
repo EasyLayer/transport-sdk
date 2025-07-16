@@ -1,5 +1,6 @@
 import type { AxiosInstance } from 'axios';
 import axios from 'axios';
+import https from 'https';
 import type { BaseTransportOptions } from '../core/transport';
 import { BaseTransport } from '../core/transport';
 import { ConnectionError, MessageError, MESSAGE_SIZE_LIMITS } from '../shared';
@@ -11,22 +12,59 @@ export interface HttpClientOptions extends BaseTransportOptions {
   baseUrl: string;
   headers?: Record<string, string>;
   maxMessageSize?: number;
+  ssl?: {
+    enabled?: boolean;
+    rejectUnauthorized?: boolean;
+    ca?: string;
+    cert?: string;
+    key?: string;
+  };
 }
 
 export class HttpTransport extends BaseTransport {
   private readonly axiosInstance: AxiosInstance;
   private readonly maxMessageSize: number;
+  private readonly sslOptions: HttpClientOptions['ssl'];
 
   constructor(options: HttpClientOptions) {
     super('http', options.name ?? 'http', options);
 
     this.maxMessageSize = options.maxMessageSize ?? MESSAGE_SIZE_LIMITS.HTTP;
+    this.sslOptions = options.ssl;
 
-    this.axiosInstance = axios.create({
+    // Auto-detect SSL from URL if not explicitly set
+    const isSSL = this.sslOptions?.enabled ?? options.baseUrl.startsWith('https://');
+
+    // Prepare axios config
+    const axiosConfig: any = {
       baseURL: options.baseUrl.replace(/\/$/, ''),
       headers: options.headers,
       timeout: this.timeout,
-    });
+    };
+
+    // Add SSL configuration if using HTTPS
+    if (isSSL && this.sslOptions) {
+      const httpsAgentOptions: any = {
+        rejectUnauthorized: this.sslOptions.rejectUnauthorized ?? true,
+      };
+
+      // Add certificate options if provided
+      if (this.sslOptions.ca) {
+        httpsAgentOptions.ca = this.sslOptions.ca;
+      }
+      if (this.sslOptions.cert) {
+        httpsAgentOptions.cert = this.sslOptions.cert;
+      }
+      if (this.sslOptions.key) {
+        httpsAgentOptions.key = this.sslOptions.key;
+      }
+
+      axiosConfig.httpsAgent = new https.Agent(httpsAgentOptions);
+    }
+
+    this.axiosInstance = axios.create(axiosConfig);
+
+    console.log(`[${this.name}] HTTP transport configured for ${options.baseUrl} ${isSSL ? '(SSL)' : '(no SSL)'}`);
   }
 
   isConnected(): boolean {
@@ -47,6 +85,7 @@ export class HttpTransport extends BaseTransport {
           status: err.response?.status,
           statusText: err.response?.statusText,
           action: message.action,
+          ssl: this.sslOptions?.enabled || false,
         },
       });
     }
@@ -70,11 +109,12 @@ export class HttpTransport extends BaseTransport {
           context: {
             status: response.status,
             action: message.action,
+            ssl: this.sslOptions?.enabled || false,
           },
         });
       }
 
-      return response.data;
+      return response.data.payload || response.data;
     } catch (err: any) {
       if (err instanceof MessageError) {
         throw err;
@@ -88,6 +128,7 @@ export class HttpTransport extends BaseTransport {
           status: err.response?.status,
           statusText: err.response?.statusText,
           action: message.action,
+          ssl: this.sslOptions?.enabled || false,
         },
       });
     }
@@ -141,6 +182,9 @@ export class HttpTransport extends BaseTransport {
         transportType: this.type,
         transportName: this.name,
         cause: err,
+        context: {
+          ssl: this.sslOptions?.enabled || false,
+        },
       });
     }
   }

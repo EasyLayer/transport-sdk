@@ -7,7 +7,7 @@ import { LoggerModule } from '@easylayer/common/logger';
 import { TransportModule } from '@easylayer/common/network-transport';
 import { Client } from '@easylayer/transport-sdk';
 
-import { TestCleanup, waitFor, sleep, generateTestId } from './utils';
+import { TestCleanup, sleep, generateTestId } from './utils';
 import { 
   TestQueryHandler, 
   TestErrorQueryHandler, 
@@ -20,13 +20,15 @@ describe('HTTP Transport E2E Tests', () => {
   let client: Client;
   let cleanup: TestCleanup;
   let serverPort: number;
+  let serverHost: string;
   let serverUrl: string;
 
   beforeEach(async () => {
     cleanup = new TestCleanup();
     
     serverPort = 3001;
-    serverUrl = `http://localhost:${serverPort}`;
+    serverHost = 'localhost';
+    serverUrl = `http://${serverHost}:${serverPort}`;
     
     @Module({
       imports: [
@@ -39,9 +41,8 @@ describe('HTTP Transport E2E Tests', () => {
           transports: [
             {
               type: 'http',
-              isEnabled: true,
+              host: serverHost,
               port: serverPort,
-              name: 'http-e2e-server',
               maxMessageSize: 1024 * 1024
             }
           ]
@@ -58,27 +59,13 @@ describe('HTTP Transport E2E Tests', () => {
 
     app = await NestFactory.create(TestAppModule, { logger: false });
     await app.init();
-    await app.listen(serverPort);
-    
-    cleanup.add(async () => {
-      if (app) {
-        await app.close();
-      }
-    });
 
     client = new Client({
       transport: {
         type: 'http',
-        name: 'http-e2e-client',
         baseUrl: serverUrl,
         timeout: 5000,
         maxMessageSize: 1024 * 1024
-      }
-    });
-
-    cleanup.add(async () => {
-      if (client) {
-        await client.destroy();
       }
     });
 
@@ -86,15 +73,16 @@ describe('HTTP Transport E2E Tests', () => {
   });
 
   afterEach(async () => {
-    await cleanup.cleanup();
+    if (app) {
+      await app.close();
+    }
+    if (client) {
+      await client.destroy();
+    }
+    await cleanup.run();
   });
 
   describe('Connection and Basic Handshake', () => {
-    it('should start HTTP server successfully', async () => {
-      expect(app).toBeDefined();
-      expect(app.getHttpServer().listening).toBe(true);
-    });
-
     it('should create HTTP client successfully', async () => {
       expect(client).toBeDefined();
       expect(client.isConnected()).toBe(true);
@@ -119,15 +107,19 @@ describe('HTTP Transport E2E Tests', () => {
         dto: { message: 'Immediate query' }
       });
 
+      // Check new QueryResult interface
       expect(response).toMatchObject({
-        action: 'queryResponse',
+        requestId,
         payload: {
           result: 'Echo: Immediate query',
           timestamp: expect.any(Number)
         },
-        requestId: requestId,
-        timestamp: expect.any(Number)
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
       });
+
+      // Verify response time tracking
+      expect(response.responseTimestamp).toBeGreaterThan(response.timestamp);
     });
 
     it('should throw error immediately when server is down', async () => {
@@ -154,13 +146,13 @@ describe('HTTP Transport E2E Tests', () => {
       });
 
       expect(response).toMatchObject({
-        action: 'queryResponse',
+        requestId,
         payload: {
           result: 'Echo: Hello HTTP!',
           timestamp: expect.any(Number)
         },
-        requestId: requestId,
-        timestamp: expect.any(Number)
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
       });
     });
 
@@ -176,29 +168,34 @@ describe('HTTP Transport E2E Tests', () => {
       const duration = Date.now() - startTime;
       
       expect(response).toMatchObject({
-        action: 'queryResponse',
+        requestId,
         payload: {
           result: 'Echo: Delayed query',
           timestamp: expect.any(Number)
         },
-        requestId: requestId
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
       });
+
       expect(duration).toBeGreaterThanOrEqual(80);
     });
 
     it('should handle error queries via HTTP response object', async () => {
       const requestId = generateTestId('error-query');
       
+      // For HTTP, errors might be returned as response with error payload
       const response = await client.query(requestId, {
         constructorName: 'TestErrorQuery',
         dto: { errorMessage: 'Test HTTP error' }
       });
       
       expect(response).toMatchObject({
-        action: 'error',
+        requestId,
         payload: expect.objectContaining({
           error: expect.stringContaining('Test HTTP error')
-        })
+        }),
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
       });
     });
 
@@ -211,10 +208,12 @@ describe('HTTP Transport E2E Tests', () => {
       });
       
       expect(response).toMatchObject({
-        action: 'error',
+        requestId,
         payload: expect.objectContaining({
           error: expect.stringContaining('query handler')
-        })
+        }),
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
       });
     });
   });
@@ -280,11 +279,13 @@ describe('HTTP Transport E2E Tests', () => {
       });
 
       expect(response).toMatchObject({
-        action: 'queryResponse',
+        requestId: expect.any(String),
         payload: {
           result: 'Echo: Event trigger',
           timestamp: expect.any(Number)
-        }
+        },
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
       });
 
       await sleep(200);
@@ -339,7 +340,6 @@ describe('HTTP Transport E2E Tests', () => {
       const timeoutClient = new Client({
         transport: {
           type: 'http',
-          name: 'timeout-client',
           baseUrl: 'http://localhost:9999',
           timeout: 1000
         }
@@ -397,18 +397,22 @@ describe('HTTP Transport E2E Tests', () => {
         r.status === 'fulfilled' && 
         r.value && 
         typeof r.value === 'object' && 
-        'action' in r.value &&
-        r.value.action === 'queryResponse' &&
+        'payload' in r.value &&
         !('error' in r.value)
       );
       
       expect(successful.length).toBeGreaterThan(0);
 
       successful.forEach((result) => {
-        if (result.status === 'fulfilled' && result.value.action === 'queryResponse') {
-          expect(result.value.payload).toMatchObject({
-            result: expect.stringContaining('Echo:'),
-            timestamp: expect.any(Number)
+        if (result.status === 'fulfilled') {
+          expect(result.value).toMatchObject({
+            requestId: expect.any(String),
+            payload: {
+              result: expect.stringContaining('Echo:'),
+              timestamp: expect.any(Number)
+            },
+            timestamp: expect.any(Number),
+            responseTimestamp: expect.any(Number)
           });
         }
       });

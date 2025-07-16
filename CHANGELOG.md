@@ -1,3 +1,10 @@
+## <small>1.1.1 (2025-07-16)</small>
+
+* chore: updated docs; ([da4c50a](https://github.com/easylayer/transport-sdk/commit/da4c50a))
+* refactor: fixed all transports and e2e tests; ([5fe5a27](https://github.com/easylayer/transport-sdk/commit/5fe5a27))
+
+
+
 ## 1.1.0 (2025-07-11)
 
 * BREAKING: refactored transports; removed tcp; added e2e tests; ([b0410ed](https://github.com/easylayer/transport-sdk/commit/b0410ed))

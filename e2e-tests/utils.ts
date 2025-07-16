@@ -1,48 +1,16 @@
-let globalCleanupCounter = 0;
-const MAX_LISTENERS = 50;
-
 export class TestCleanup {
-  private cleanupFunctions: Array<() => Promise<void> | void> = [];
-  private isDestroyed = false;
-  private readonly id: number;
+  private fns: Array<() => Promise<void> | void> = [];
 
-  constructor() {
-    this.id = ++globalCleanupCounter;
-    
-    if (this.id === 1) {
-      process.setMaxListeners(MAX_LISTENERS);
+  add(fn: () => Promise<void> | void) { this.fns.push(fn); }
+
+  async run() {
+    for (const fn of this.fns.reverse()) {
+      try { await fn(); } catch { /* ignore */ }
     }
-  }
-
-  add(fn: () => Promise<void> | void): void {
-    if (this.isDestroyed) {
-      return;
-    }
-    this.cleanupFunctions.push(fn);
-  }
-
-  async cleanup(): Promise<void> {
-    if (this.isDestroyed) {
-      return;
-    }
-
-    this.isDestroyed = true;
-    
-    const functions = [...this.cleanupFunctions].reverse();
-    this.cleanupFunctions = [];
-
-    for (const fn of functions) {
-      try {
-        const result = fn();
-        if (result instanceof Promise) {
-          await result;
-        }
-      } catch (error) {
-        // Silent cleanup errors
-      }
-    }
+    this.fns.length = 0;
   }
 }
+
 
 export async function waitFor(
   condition: () => boolean, 

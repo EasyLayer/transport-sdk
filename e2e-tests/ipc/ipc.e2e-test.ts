@@ -24,12 +24,6 @@ describe('IPC Transport E2E Tests', () => {
       }
     });
 
-    cleanup.add(() => {
-      if (childProcess && !childProcess.killed) {
-        childProcess.kill('SIGKILL');
-      }
-    });
-
     return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         reject(new Error('IPC server failed to start within 5s'));
@@ -67,7 +61,7 @@ describe('IPC Transport E2E Tests', () => {
         });
         
         childProcess.stderr?.on('data', (data) => {
-          // console.error(`[IPC STDERR]: ${data.toString()}`);
+          console.error(`[IPC STDERR]: ${data.toString()}`);
         });
       // }
     });
@@ -77,18 +71,10 @@ describe('IPC Transport E2E Tests', () => {
     client = new Client({
       transport: {
         type: 'ipc',
-        name: 'ipc-e2e-client',
         child: childProcess,
-        connectionTimeout: 3000,
         heartbeatTimeout: 4000,
         maxMessageSize: 1024 * 1024,
         timeout: 5000
-      }
-    });
-
-    cleanup.add(async () => {
-      if (client) {
-        await client.destroy();
       }
     });
 
@@ -99,11 +85,21 @@ describe('IPC Transport E2E Tests', () => {
     cleanup = new TestCleanup();
   });
 
-  afterEach(async () => {
-    await cleanup.cleanup();
+  afterEach(async () => {    
+    if (client) {
+      await client.destroy();
+    }
+
+    if (childProcess) {
+      childProcess.removeAllListeners();
+      childProcess.stdout?.removeAllListeners();
+      childProcess.stderr?.removeAllListeners();
+    }
+
+    await cleanup.run();
     
     await sleep(300);
-    
+
     if (childProcess && !childProcess.killed) {
       childProcess.kill('SIGKILL');
     }
@@ -139,9 +135,7 @@ describe('IPC Transport E2E Tests', () => {
       client = new Client({
         transport: {
           type: 'ipc',
-          name: 'timeout-client',
           child: childProcess,
-          connectionTimeout: 1500,
           heartbeatTimeout: 2000,
           timeout: 3000
         }
@@ -181,9 +175,7 @@ describe('IPC Transport E2E Tests', () => {
       client = new Client({
         transport: {
           type: 'ipc',
-          name: 'ipc-wait-client',
           child: childProcess,
-          connectionTimeout: 5000,
           heartbeatTimeout: 6000,
           timeout: 8000
         }
@@ -205,9 +197,15 @@ describe('IPC Transport E2E Tests', () => {
 
       const duration = Date.now() - startTime;
       
+      // Check new QueryResult interface
       expect(response).toMatchObject({
-        result: 'Echo: Immediate query',
-        timestamp: expect.any(Number)
+        requestId,
+        payload: {
+          result: 'Echo: Immediate query',
+          timestamp: expect.any(Number),
+        },
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
       });
       
       expect(duration).toBeGreaterThan(50);
@@ -222,9 +220,7 @@ describe('IPC Transport E2E Tests', () => {
       client = new Client({
         transport: {
           type: 'ipc',
-          name: 'dead-server-client',
           child: childProcess,
-          connectionTimeout: 1500,
           heartbeatTimeout: 2000,
           timeout: 3000
         }
@@ -264,9 +260,17 @@ describe('IPC Transport E2E Tests', () => {
       });
 
       expect(response).toMatchObject({
-        result: 'Echo: Hello IPC!',
-        timestamp: expect.any(Number)
+        requestId,
+        payload: {
+          result: 'Echo: Hello IPC!',
+          timestamp: expect.any(Number)
+        },
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
       });
+
+      // Verify response time tracking
+      expect(response.responseTimestamp).toBeGreaterThan(response.timestamp);
     });
 
     it('should handle query with delay', async () => {
@@ -280,7 +284,16 @@ describe('IPC Transport E2E Tests', () => {
 
       const duration = Date.now() - startTime;
       
-      expect(response.result).toBe('Echo: Delayed IPC query');
+      expect(response).toMatchObject({
+        requestId,
+        payload: {
+          result: 'Echo: Delayed IPC query',
+          timestamp: expect.any(Number)
+        },
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
+      });
+
       expect(duration).toBeGreaterThanOrEqual(80);
     });
 
@@ -321,9 +334,9 @@ describe('IPC Transport E2E Tests', () => {
         dto: { count: 3, delay: 30 }
       });
 
-      if (response && typeof response[Symbol.asyncIterator] === 'function') {
+      if (response.payload && typeof response.payload[Symbol.asyncIterator] === 'function') {
         const receivedItems: any[] = [];
-        for await (const item of response) {
+        for await (const item of response.payload) {
           receivedItems.push(item);
         }
         
@@ -335,7 +348,7 @@ describe('IPC Transport E2E Tests', () => {
           });
         });
       } else {
-        expect(response).toBeDefined();
+        expect(response.payload).toBeDefined();
       }
     });
 
@@ -374,8 +387,13 @@ describe('IPC Transport E2E Tests', () => {
       });
 
       expect(response).toMatchObject({
-        result: 'Echo: Event trigger via IPC',
-        timestamp: expect.any(Number)
+        requestId: expect.any(String),
+        payload: {
+          result: 'Echo: Event trigger via IPC',
+          timestamp: expect.any(Number)
+        },
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
       });
 
       try {
@@ -447,8 +465,13 @@ describe('IPC Transport E2E Tests', () => {
       successful.forEach((result) => {
         if (result.status === 'fulfilled') {
           expect(result.value).toMatchObject({
-            result: expect.stringContaining('Echo:'),
-            timestamp: expect.any(Number)
+            requestId: expect.any(String),
+            payload: {
+              result: expect.stringContaining('Echo:'),
+              timestamp: expect.any(Number)
+            },
+            timestamp: expect.any(Number),
+            responseTimestamp: expect.any(Number)
           });
         }
       });
@@ -470,8 +493,13 @@ describe('IPC Transport E2E Tests', () => {
       expect(results).toHaveLength(queryCount);
       results.forEach((result, index) => {
         expect(result).toMatchObject({
-          result: `Echo: Rapid IPC message ${index}`,
-          timestamp: expect.any(Number)
+          requestId: expect.any(String),
+          payload: {
+            result: `Echo: Rapid IPC message ${index}`,
+            timestamp: expect.any(Number)
+          },
+          timestamp: expect.any(Number),
+          responseTimestamp: expect.any(Number)
         });
       });
     });

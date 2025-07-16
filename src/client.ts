@@ -7,6 +7,13 @@ export interface ClientOptions {
   transport: ClientTransportOptions;
 }
 
+export interface QueryResult<T = any> {
+  requestId: string;
+  payload: T;
+  timestamp: number;
+  responseTimestamp: number;
+}
+
 export class Client {
   private _transport: ITransport;
 
@@ -18,7 +25,6 @@ export class Client {
       this._transport.destroy().catch(() => {
         // Silently handle shutdown errors
       });
-
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
   }
@@ -30,23 +36,30 @@ export class Client {
   /**
    * Execute a query and wait for response
    */
-  public async query<T = any>(requestId: string, payload: BasePayload): Promise<T> {
+  public async query<T = any>(requestId: string, payload: BasePayload): Promise<QueryResult<T>> {
     if (!requestId) {
       throw new MessageError('requestId is required', {
         transportType: this.transport.type,
-        transportName: this.transport.name,
         context: { payload },
       });
     }
 
+    const timestamp = Date.now();
     const message: IncomingMessage = {
       action: 'query',
       requestId,
       payload,
-      timestamp: Date.now(),
+      timestamp,
     };
 
-    return await this.transport.sendAndAwait<T>(message);
+    const responsePayload = await this.transport.sendAndAwait<T>(message);
+
+    return {
+      requestId,
+      payload: responsePayload,
+      timestamp,
+      responseTimestamp: Date.now(),
+    };
   }
 
   /**

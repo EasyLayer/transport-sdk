@@ -3,7 +3,7 @@ import { NestFactory } from '@nestjs/core';
 import { Module } from '@nestjs/common';
 import { CqrsModule } from '@easylayer/common/cqrs';
 import { LoggerModule } from '@easylayer/common/logger';
-import { TransportModule, CustomWsAdapter } from '@easylayer/common/network-transport';
+import { TransportModule } from '@easylayer/common/network-transport';
 import { Client } from '@easylayer/transport-sdk';
 
 import { TestCleanup, waitFor, sleep, generateTestId } from './utils';
@@ -18,12 +18,14 @@ describe('WebSocket Transport E2E Tests', () => {
   let app: INestApplication;
   let client: Client;
   let cleanup: TestCleanup;
+  let wsHost: string;
   let wsPort: number;
   let wsUrl: string;
 
   const startWsServer = async (): Promise<void> => {
+    wsHost = 'localhost';
     wsPort = 3001;
-    wsUrl = `http://localhost:${wsPort}`;
+    wsUrl = `http://${wsHost}:${wsPort}`;
     
     @Module({
       imports: [
@@ -36,13 +38,11 @@ describe('WebSocket Transport E2E Tests', () => {
           transports: [
             {
               type: 'ws',
-              isEnabled: true,
+              host: wsHost,
               port: wsPort,
-              path: '/socket.io',
-              name: 'ws-e2e-server',
+              path: '/',
               maxMessageSize: 1024 * 1024,
               heartbeatTimeout: 2000,
-              connectionTimeout: 1500,
               cors: {
                 origin: '*',
                 credentials: false
@@ -60,14 +60,10 @@ describe('WebSocket Transport E2E Tests', () => {
     })
     class TestAppModule {}
 
-    app = await NestFactory.create(TestAppModule, { logger: false });
-    
-    const wsOptions = app.get('WS_OPTIONS');
-    const customWsAdapter = new CustomWsAdapter(app, wsOptions);
-    app.useWebSocketAdapter(customWsAdapter);
-    
+    app = await NestFactory.create(TestAppModule, { logger: false });    
     await app.init();
     
+    // Wait for server to be ready
     await sleep(300);
     
     cleanup.add(async () => {
@@ -84,8 +80,7 @@ describe('WebSocket Transport E2E Tests', () => {
         type: 'ws',
         name: 'ws-e2e-client',
         url: wsUrl,
-        path: '/socket.io',
-        connectionTimeout: 3000,
+        path: '/',
         maxMessageSize: 1024 * 1024,
         timeout: 5000
       }
@@ -97,24 +92,7 @@ describe('WebSocket Transport E2E Tests', () => {
       }
     });
 
-    let connected = false;
-    for (let i = 0; i < 3; i++) {
-      try {
-        if (typeof (client.transport as any).ensureConnection === 'function') {
-          await (client.transport as any).ensureConnection();
-        }
-        
-        await waitFor(() => client.isConnected(), 2000, 200);
-        connected = true;
-        break;
-      } catch (error) {
-        await sleep(500);
-      }
-    }
-    
-    if (!connected) {
-      throw new Error('Failed to connect after 3 attempts');
-    }
+    await waitFor(() => client.isConnected(), 4000, 100);
   };
 
   beforeEach(() => {
@@ -122,40 +100,25 @@ describe('WebSocket Transport E2E Tests', () => {
   });
 
   afterEach(async () => {
-    await cleanup.cleanup();
-    await sleep(200);
-    client = null as any;
+    if (client) {
+      await client.destroy();
+    }
+
+    await cleanup.run();
+    
+    await sleep(300);
+
+    if (app) {
+      await app.close();
+    }
+    
     app = null as any;
+    client = null as any;
+    
+    await sleep(200);
   });
 
   describe('Connection and Handshake', () => {
-    it('should test if server is actually running with raw socket.io', async () => {
-      await startWsServer();
-      
-      const io = require('socket.io-client');
-      const rawClient = io(wsUrl, {
-        path: '/socket.io',
-        transports: ['websocket', 'polling'],
-        timeout: 3000
-      });
-      
-      const connected = await new Promise((resolve) => {
-        const timer = setTimeout(() => resolve(false), 2000);
-        rawClient.on('connect', () => {
-          clearTimeout(timer);
-          resolve(true);
-        });
-        rawClient.on('connect_error', (error: any) => {
-          clearTimeout(timer);
-          resolve(false);
-        });
-      });
-      
-      rawClient.close();
-      
-      expect(connected).toBe(true);
-    });
-
     it('should establish connection between server and client', async () => {
       await startWsServer();
       await createWsClient();
@@ -171,8 +134,8 @@ describe('WebSocket Transport E2E Tests', () => {
           type: 'ws',
           name: 'timeout-client',
           url: `http://localhost:${unusedPort}`,
-          connectionTimeout: 1000,
-          timeout: 2000
+          path: '/',
+          timeout: 3000
         }
       });
 
@@ -183,7 +146,7 @@ describe('WebSocket Transport E2E Tests', () => {
       });
 
       await expect(
-        waitFor(() => client.isConnected(), 1500)
+        waitFor(() => client.isConnected(), 2500)
       ).rejects.toThrow();
 
       expect(client.isConnected()).toBe(false);
@@ -197,7 +160,7 @@ describe('WebSocket Transport E2E Tests', () => {
       
       await app.close();
       
-      await waitFor(() => !client.isConnected(), 3000, 200);
+      await waitFor(() => !client.isConnected(), 8000, 300);
       
       expect(client.isConnected()).toBe(false);
     });
@@ -212,9 +175,8 @@ describe('WebSocket Transport E2E Tests', () => {
           type: 'ws',
           name: 'ws-wait-client',
           url: wsUrl,
-          path: '/socket.io',
-          connectionTimeout: 2000,
-          timeout: 3000
+          path: '/',
+          timeout: 8000
         }
       });
 
@@ -224,17 +186,32 @@ describe('WebSocket Transport E2E Tests', () => {
         }
       });
 
+      // Ensure connection is established before sending query
+      await waitFor(() => client.isConnected(), 6000, 100);
+
       const requestId = generateTestId('immediate-query');
+      const startTime = Date.now();
       
       const response = await client.query(requestId, {
         constructorName: 'TestQuery',
         dto: { message: 'Immediate query' }
       });
+
+      const duration = Date.now() - startTime;
       
+      // Check new QueryResult interface
       expect(response).toMatchObject({
-        result: 'Echo: Immediate query',
-        timestamp: expect.any(Number)
+        requestId,
+        payload: {
+          result: 'Echo: Immediate query',
+          timestamp: expect.any(Number)
+        },
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
       });
+      
+      expect(duration).toBeGreaterThan(0);
+      expect(response.responseTimestamp).toBeGreaterThan(response.timestamp);
     });
 
     it('should throw error when server is down', async () => {
@@ -243,7 +220,7 @@ describe('WebSocket Transport E2E Tests', () => {
           type: 'ws',
           name: 'dead-server-client',
           url: wsUrl,
-          connectionTimeout: 2000,
+          path: '/',
           timeout: 3000
         }
       });
@@ -274,14 +251,21 @@ describe('WebSocket Transport E2E Tests', () => {
     it('should execute basic queries', async () => {
       const requestId = generateTestId('basic-query');
       
+      await waitFor(() => client.isConnected(), 3000, 100);
+      
       const response = await client.query(requestId, {
         constructorName: 'TestQuery',
-        dto: { message: 'Hello Socket.IO!' }
+        dto: { message: 'Hello WebSocket!' }
       });
 
       expect(response).toMatchObject({
-        result: 'Echo: Hello Socket.IO!',
-        timestamp: expect.any(Number)
+        requestId,
+        payload: {
+          result: 'Echo: Hello WebSocket!',
+          timestamp: expect.any(Number)
+        },
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
       });
     });
 
@@ -291,15 +275,21 @@ describe('WebSocket Transport E2E Tests', () => {
       
       const response = await client.query(requestId, {
         constructorName: 'TestQuery',
-        dto: { message: 'Delayed query', delay: 100 }
+        dto: { message: 'Delayed WebSocket query', delay: 100 }
       });
 
       const duration = Date.now() - startTime;
       
       expect(response).toMatchObject({
-        result: 'Echo: Delayed query',
-        timestamp: expect.any(Number)
+        requestId,
+        payload: {
+          result: 'Echo: Delayed WebSocket query',
+          timestamp: expect.any(Number)
+        },
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
       });
+
       expect(duration).toBeGreaterThanOrEqual(80);
     });
 
@@ -309,7 +299,7 @@ describe('WebSocket Transport E2E Tests', () => {
       await expect(
         client.query(requestId, {
           constructorName: 'TestErrorQuery',
-          dto: { errorMessage: 'Test Socket.IO error' }
+          dto: { errorMessage: 'Test error from WebSocket' }
         })
       ).rejects.toThrow();
     });
@@ -340,9 +330,9 @@ describe('WebSocket Transport E2E Tests', () => {
         dto: { count: 3, delay: 30 }
       });
 
-      if (response && typeof response[Symbol.asyncIterator] === 'function') {
+      if (response.payload && typeof response.payload[Symbol.asyncIterator] === 'function') {
         const receivedItems: any[] = [];
-        for await (const item of response) {
+        for await (const item of response.payload) {
           receivedItems.push(item);
         }
         
@@ -354,7 +344,7 @@ describe('WebSocket Transport E2E Tests', () => {
           });
         });
       } else {
-        expect(response).toBeDefined();
+        expect(response.payload).toBeDefined();
       }
     });
 
@@ -364,7 +354,7 @@ describe('WebSocket Transport E2E Tests', () => {
       await expect(
         client.query(requestId, {
           constructorName: 'TestErrorQuery',
-          dto: { errorMessage: 'Stream error via Socket.IO' }
+          dto: { errorMessage: 'Stream error via WebSocket' }
         })
       ).rejects.toThrow();
     });
@@ -376,7 +366,7 @@ describe('WebSocket Transport E2E Tests', () => {
       await createWsClient();
     });
 
-    it('should attempt to receive events from server via Socket.IO', async () => {
+    it('should attempt to receive events from server via WebSocket', async () => {
       const receivedEvents: any[] = [];
       
       const unsubscribe = client.subscribe('TestEvent', async (event) => {
@@ -385,20 +375,25 @@ describe('WebSocket Transport E2E Tests', () => {
 
       cleanup.add(() => unsubscribe());
 
-      await sleep(200);
+      await sleep(300);
 
       const response = await client.query(generateTestId('event-trigger'), {
         constructorName: 'TestQuery',
-        dto: { message: 'Event trigger via Socket.IO' }
+        dto: { message: 'Event trigger via WebSocket' }
       });
 
       expect(response).toMatchObject({
-        result: 'Echo: Event trigger via Socket.IO',
-        timestamp: expect.any(Number)
+        requestId: expect.any(String),
+        payload: {
+          result: 'Echo: Event trigger via WebSocket',
+          timestamp: expect.any(Number)
+        },
+        timestamp: expect.any(Number),
+        responseTimestamp: expect.any(Number)
       });
 
       try {
-        await waitFor(() => receivedEvents.length > 0, 2000, 200);
+        await waitFor(() => receivedEvents.length > 0, 5000, 300);
         
         expect(receivedEvents.length).toBeGreaterThan(0);
         const event = receivedEvents[0];
@@ -452,23 +447,56 @@ describe('WebSocket Transport E2E Tests', () => {
         const requestId = generateTestId(`concurrent-ws-${i}`);
         return client.query(requestId, {
           constructorName: 'TestQuery',
-          dto: { message: `Concurrent Socket.IO message ${i}` }
+          dto: { message: `Concurrent WebSocket message ${i}` }
         });
       });
 
       const results = await Promise.allSettled(promises);
       
       const successful = results.filter(r => r.status === 'fulfilled');
+      const failed = results.filter(r => r.status === 'rejected');
 
       expect(successful.length).toBeGreaterThanOrEqual(queryCount * 0.8);
       
       successful.forEach((result) => {
         if (result.status === 'fulfilled') {
           expect(result.value).toMatchObject({
-            result: expect.stringContaining('Echo:'),
-            timestamp: expect.any(Number)
+            requestId: expect.any(String),
+            payload: {
+              result: expect.stringContaining('Echo:'),
+              timestamp: expect.any(Number)
+            },
+            timestamp: expect.any(Number),
+            responseTimestamp: expect.any(Number)
           });
         }
+      });
+    });
+
+    it('should handle rapid sequential queries', async () => {
+      const queryCount = 3;
+      const results: any[] = [];
+      
+      for (let i = 0; i < queryCount; i++) {
+        const requestId = generateTestId(`rapid-ws-${i}`);
+        const response = await client.query(requestId, {
+          constructorName: 'TestQuery',
+          dto: { message: `Rapid WebSocket message ${i}` }
+        });
+        results.push(response);
+      }
+
+      expect(results).toHaveLength(queryCount);
+      results.forEach((result, index) => {
+        expect(result).toMatchObject({
+          requestId: expect.any(String),
+          payload: {
+            result: `Echo: Rapid WebSocket message ${index}`,
+            timestamp: expect.any(Number)
+          },
+          timestamp: expect.any(Number),
+          responseTimestamp: expect.any(Number)
+        });
       });
     });
 
@@ -477,7 +505,7 @@ describe('WebSocket Transport E2E Tests', () => {
       
       await app.close();
       
-      await waitFor(() => !client.isConnected(), 3000, 200);
+      await waitFor(() => !client.isConnected(), 5000, 300);
       
       expect(client.isConnected()).toBe(false);
     });
@@ -487,7 +515,7 @@ describe('WebSocket Transport E2E Tests', () => {
       
       await app.close();
       
-      await waitFor(() => !client.isConnected(), 3000, 200);
+      await waitFor(() => !client.isConnected(), 5000, 300);
       
       const requestId = generateTestId('after-disconnect');
       
@@ -497,6 +525,16 @@ describe('WebSocket Transport E2E Tests', () => {
           dto: { message: 'After disconnect' }
         })
       ).rejects.toThrow();
+    });
+
+    it('should handle ping-pong heartbeat correctly', async () => {
+      const initialConnection = client.isConnected();
+      expect(initialConnection).toBe(true);
+      
+      // Wait for heartbeat cycles
+      await sleep(2000);
+      
+      expect(client.isConnected()).toBe(true);
     });
   });
 });

@@ -677,9 +677,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@easylayer/common@npm:0.8.0":
-  version: 0.8.0
-  resolution: "@easylayer/common@npm:0.8.0"
+"@easylayer/common@npm:0.9.1":
+  version: 0.9.1
+  resolution: "@easylayer/common@npm:0.9.1"
   dependencies:
     "@nestjs/common": "npm:10.2.10"
     "@nestjs/core": "npm:10.2.10"
@@ -710,7 +710,7 @@ __metadata:
     typeorm: "npm:0.3.20"
     typeorm-transactional: "npm:0.5.0"
     uuid: "npm:9.0.1"
-  checksum: 10/86342a0301cd8fe8c5940c2b45618f39b7b90b1901f5fccce4c4819e67ce0ef125d7355a406e495e1f43e917aeb83f3d95e8d8b1c08e235c37a4cad77c657938
+  checksum: 10/dbddb46ffd0dc818e9f581a1352c26df739b9321987ebeb42c329d905483dc5016b0684dc93808ad3c477d0f184eda77006d4e98a3c0eb0d40526c8301c83534
   languageName: node
   linkType: hard
 
@@ -720,7 +720,7 @@ __metadata:
   dependencies:
     "@commitlint/cli": "npm:18.4.3"
     "@commitlint/config-conventional": "npm:18.4.3"
-    "@easylayer/common": "npm:0.8.0"
+    "@easylayer/common": "npm:0.9.1"
     "@eslint/eslintrc": "npm:3.3.1"
     "@eslint/js": "npm:9.26.0"
     "@nestjs/common": "npm:10.2.10"
