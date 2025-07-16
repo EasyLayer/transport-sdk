@@ -13,6 +13,27 @@ export interface BaseTransportOptions {
   name?: string;
 }
 
+// ------------------------------------------------------------
+// Helper: decode `payload` if it arrived as a JSON string.
+// Tries JSON.parse – if it fails, returns value unchanged.
+// ------------------------------------------------------------
+function decodeNestedPayload<T = any>(data: T): T {
+  if (
+    data &&
+    typeof data === 'object' &&
+    // @ts-ignore runtime shape check
+    typeof (data as any).payload === 'string'
+  ) {
+    try {
+      const parsed = JSON.parse((data as any).payload);
+      return { ...(data as any), payload: parsed } as T;
+    } catch {
+      /* not a JSON string – leave as is */
+    }
+  }
+  return data;
+}
+
 export abstract class BaseTransport implements ITransport {
   readonly type: TransportType;
   readonly name: string;
@@ -102,7 +123,8 @@ export abstract class BaseTransport implements ITransport {
         });
       }
 
-      return result as R;
+      const decoded = decodeNestedPayload(result);
+      return decoded as R;
     } finally {
       clearTimeout(timer!);
     }
@@ -119,9 +141,7 @@ export abstract class BaseTransport implements ITransport {
   }
 
   protected async handleMessage(message: OutgoingMessage): Promise<any> {
-    if (!message || typeof message.action !== 'string') {
-      return;
-    }
+    if (!message || typeof message.action !== 'string') return;
 
     switch (message.action) {
       case 'ping': {
@@ -135,10 +155,7 @@ export abstract class BaseTransport implements ITransport {
 
       case 'event': {
         const payload = message.payload as BasePayload;
-        if (!payload?.constructorName) {
-          return;
-        }
-
+        if (!payload?.constructorName) return;
         const listeners = this.subscriptions.get(payload.constructorName) || [];
         await Promise.allSettled(Array.from(listeners).map((cb) => cb(payload.dto)));
         return;
@@ -147,25 +164,17 @@ export abstract class BaseTransport implements ITransport {
       case 'eventsBatch': {
         const candidate = message.payload as BasePayload | BasePayload[];
         const payloads: BasePayload[] = Array.isArray(candidate) ? candidate : [candidate];
-
         for (const payload of payloads) {
-          if (!payload?.constructorName) {
-            continue;
-          }
-
+          if (!payload?.constructorName) continue;
           const listeners = this.subscriptions.get(payload.constructorName) || [];
           await Promise.allSettled(Array.from(listeners).map((cb) => cb(payload.dto)));
         }
         return;
       }
 
-      case 'queryResponse': {
-        return message.payload;
-      }
-
-      case 'streamResponse': {
-        return message.payload;
-      }
+      case 'queryResponse':
+      case 'streamResponse':
+        return decodeNestedPayload(message.payload);
 
       case 'streamEnd': {
         return { ended: true };
@@ -173,10 +182,7 @@ export abstract class BaseTransport implements ITransport {
 
       case 'error': {
         const errorPayload = message.payload as ErrorPayload;
-        throw ErrorUtils.fromErrorPayload(errorPayload, {
-          type: this.type,
-          name: this.name,
-        });
+        throw ErrorUtils.fromErrorPayload(errorPayload, { type: this.type, name: this.name });
       }
 
       case 'pong': {

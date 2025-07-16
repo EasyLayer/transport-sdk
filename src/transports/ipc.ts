@@ -18,7 +18,6 @@ export interface IpcClientOptions extends BaseTransportOptions {
   child: ChildProcess;
   heartbeatTimeout?: number;
   maxMessageSize?: number;
-  connectionTimeout?: number; // New: timeout for initial connection
 }
 
 interface IpcMessage extends IncomingMessage {
@@ -27,8 +26,8 @@ interface IpcMessage extends IncomingMessage {
 
 export class IpcTransport extends BaseTransport {
   private child: ChildProcess;
+  private readonly onMsg: (m: unknown) => void;
   private readonly heartbeatTimeout: number;
-  private readonly connectionTimeout: number;
   private readonly maxMessageSize: number;
   private readonly pendings = new Map<
     string,
@@ -39,6 +38,7 @@ export class IpcTransport extends BaseTransport {
     }
   >();
   private lastPingTime = 0;
+  private businessConnected = false;
 
   constructor(options: IpcClientOptions) {
     super('ipc', options.name ?? 'ipc', options);
@@ -46,39 +46,45 @@ export class IpcTransport extends BaseTransport {
     if (!options.child) {
       throw new TransportInitError('ChildProcess is required for IPC transport', {
         transportType: this.type,
-        transportName: this.name,
       });
     }
 
     this.child = options.child;
     this.heartbeatTimeout = options.heartbeatTimeout ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
-    this.connectionTimeout = options.connectionTimeout ?? 5000; // Default 5s for connection
     this.maxMessageSize = options.maxMessageSize ?? MESSAGE_SIZE_LIMITS.IPC;
 
     if (!options.child.send) {
       throw new TransportInitError('ChildProcess lacks .send() method', {
         transportType: this.type,
-        transportName: this.name,
         context: { hasConnected: options.child.connected },
       });
     }
 
-    options.child.on('message', this.onMessage.bind(this));
+    this.onMsg = this.onMessage.bind(this);
+    options.child.on('message', this.onMsg);
   }
 
   isConnected(): boolean {
-    return this.child.connected && Date.now() - this.lastPingTime < this.heartbeatTimeout;
+    return this.isIpcConnected() && this.isBusinessConnected();
+  }
+
+  isIpcConnected(): boolean {
+    return this.child.connected;
+  }
+
+  isBusinessConnected(): boolean {
+    return this.businessConnected && Date.now() - this.lastPingTime < this.heartbeatTimeout;
   }
 
   async destroy(): Promise<void> {
-    this.child.off('message', this.onMessage);
+    this.businessConnected = false;
+    this.child.off('message', this.onMsg);
 
     Array.from(this.pendings.values()).forEach((pending) => {
       clearTimeout(pending.timer);
       pending.reject(
         new DestroyError('Transport destroyed', {
           transportType: this.type,
-          transportName: this.name,
         })
       );
     });
@@ -87,6 +93,7 @@ export class IpcTransport extends BaseTransport {
 
   protected async forward(msg: IncomingMessage): Promise<void> {
     await this.waitForConnection();
+
     const ipcMessage = this.createIpcMessage(msg);
     validateMessageSize(ipcMessage, this.maxMessageSize, this.type, this.name);
     this.child.send(ipcMessage);
@@ -96,6 +103,7 @@ export class IpcTransport extends BaseTransport {
     // IMPORTANT: Client waits for connection timeout before giving up,
     // but once connected, has separate timeout for the actual request
     await this.waitForConnection();
+
     const ipcMessage = this.createIpcMessage(msg);
     validateMessageSize(ipcMessage, this.maxMessageSize, this.type, this.name);
 
@@ -109,7 +117,6 @@ export class IpcTransport extends BaseTransport {
             this.timeout,
             {
               transportType: this.type,
-              transportName: this.name,
               action: msg.action,
               requestId: ipcMessage.correlationId,
             }
@@ -126,7 +133,6 @@ export class IpcTransport extends BaseTransport {
           reject(
             new ConnectionError('Failed to send IPC message', {
               transportType: this.type,
-              transportName: this.name,
               cause: err,
               context: { correlationId: ipcMessage.correlationId, action: msg.action },
             })
@@ -164,11 +170,11 @@ export class IpcTransport extends BaseTransport {
     try {
       const start = Date.now();
       while (!this.isConnected()) {
-        if (Date.now() - start > this.connectionTimeout) {
-          throw new ConnectionError(`No ping from child — connection timeout after ${this.connectionTimeout}ms`, {
+        if (Date.now() - start > this.heartbeatTimeout) {
+          throw new ConnectionError(`No ping from child — heartbeat timeout after ${this.heartbeatTimeout}ms`, {
             transportType: this.type,
             transportName: this.name,
-            context: { connectionTimeoutMs: this.connectionTimeout },
+            context: { heartbeatTimeoutMs: this.heartbeatTimeout },
           });
         }
         await new Promise((r) => setTimeout(r, 100)); // Check every 100ms
@@ -178,11 +184,12 @@ export class IpcTransport extends BaseTransport {
     }
   }
 
-  private onMessage = (raw: any): void => {
+  private onMessage(raw: any): void {
     if (!raw || typeof raw !== 'object') return;
     const { correlationId, action, payload, requestId } = raw as any;
     if (typeof correlationId !== 'string' || typeof action !== 'string') return;
 
+    // Handle responses to pending requests
     if (this.pendings.has(correlationId)) {
       const { resolve, reject, timer } = this.pendings.get(correlationId)!;
       clearTimeout(timer);
@@ -201,17 +208,20 @@ export class IpcTransport extends BaseTransport {
       return resolve(payload);
     }
 
+    // Handle ping/pong - business connection
     if (action === 'ping') {
       this.lastPingTime = Date.now();
-      this.child.send({ action: 'pong', correlationId });
+      this.businessConnected = true;
+      this.child.send({ action: 'pong', correlationId, requestId });
       return;
     }
 
+    // Handle events
     if (action === 'event' || action === 'eventsBatch') {
       this.handleMessage({ action, payload, requestId }).catch(() => {
         // Silently handle errors in client
       });
       return;
     }
-  };
+  }
 }

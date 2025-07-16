@@ -4,7 +4,6 @@ import { Module } from '@nestjs/common';
 import { CqrsModule } from '@easylayer/common/cqrs';
 import { LoggerModule } from '@easylayer/common/logger';
 import { TransportModule } from '@easylayer/common/network-transport';
-
 import { 
   TestQueryHandler, 
   TestErrorQueryHandler, 
@@ -23,8 +22,6 @@ import {
       transports: [
         {
           type: 'ipc',
-          isEnabled: true,
-          name: 'ipc-child-server',
           maxMessageSize: 1024 * 1024,
           heartbeatTimeout: 3000,
           connectionTimeout: 2000
