@@ -172,7 +172,8 @@ All requests are sent as POST to the base URL with the following JSON body:
     "name": "John Doe",
     "email": "john@example.com"
   },
-  "timestamp": 1640995201000
+  "timestamp": 1640995201000,
+  "responseTimestamp": 1640996201000
 }
 ```
 
@@ -203,7 +204,6 @@ interface WsClientOptions {
   url: string;              // Required: WebSocket server URL
   path?: string;            // Optional: Socket.IO path (default: '/socket.io')
   maxMessageSize?: number;  // Optional: Max message size (default: 10MB)
-  connectionTimeout?: number; // Optional: Connection timeout (default: 8s)
   timeout?: number;         // Optional: Request timeout (default: 30s)
   name?: string;           // Optional: Transport name for debugging
 }
@@ -216,7 +216,6 @@ const client = new Client({
     type: 'ws',
     url: 'http://localhost:3001',
     path: '/socket.io',
-    connectionTimeout: 5000,
     maxMessageSize: 5 * 1024 * 1024, // 5MB
   },
 });
@@ -232,7 +231,8 @@ Messages are sent over WebSocket connection:
     "constructorName": "GetUserQuery",
     "dto": { "userId": "user123" }
   },
-  "timestamp": 1640995200000
+  "timestamp": 1640995200000,
+  "responseTimestamp": 1640996201000
 }
 ```
 
@@ -268,7 +268,6 @@ interface IpcClientOptions {
   child: ChildProcess;       // Required: Child process instance
   heartbeatTimeout?: number; // Optional: Heartbeat timeout (default: 30s)
   maxMessageSize?: number;   // Optional: Max message size (default: 1MB)
-  connectionTimeout?: number; // Optional: Connection timeout (default: 5s)
   timeout?: number;          // Optional: Request timeout (default: 30s)
   name?: string;            // Optional: Transport name for debugging
 }
@@ -284,7 +283,6 @@ const client = new Client({
     type: 'ipc',
     child,
     heartbeatTimeout: 10000,
-    connectionTimeout: 3000,
   },
 });
 ```
@@ -294,12 +292,13 @@ Messages are sent as JSON objects through IPC:
 ```json
 {
   "action": "query",
-  "correlationId": "generated_correlation_id",
+  "requestId": "generated_request_id",
   "payload": {
     "constructorName": "GetUserQuery", 
     "dto": { "userId": "user123" }
   },
-  "timestamp": 1640995200000
+  "timestamp": 1640995200000,
+  "responseTimestamp": 1640996201000
 }
 ```
 
@@ -307,7 +306,7 @@ Messages are sent as JSON objects through IPC:
 ```json
 {
   "action": "queryResponse",
-  "correlationId": "generated_correlation_id",
+  "requestId": "generated_request_id",
   "payload": {
     "id": "user123",
     "name": "John Doe"
