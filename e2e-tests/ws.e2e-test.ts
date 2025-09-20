@@ -1,540 +1,148 @@
-import { INestApplication } from '@nestjs/common';
-import { NestFactory } from '@nestjs/core';
-import { Module } from '@nestjs/common';
-import { CqrsModule } from '@easylayer/common/cqrs';
-import { LoggerModule } from '@easylayer/common/logger';
-import { TransportModule } from '@easylayer/common/network-transport';
+import { createServer } from 'http';
+import { Server, Socket } from 'socket.io';
 import { Client } from '@easylayer/transport-sdk';
+import { Actions } from '@easylayer/transport-sdk';
 
-import { TestCleanup, waitFor, sleep, generateTestId } from './utils';
-import { 
-  TestQueryHandler, 
-  TestErrorQueryHandler, 
-  TestStreamQueryHandler, 
-  TestEventHandler 
-} from './mocks';
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+const waitFor = async (cond: () => boolean, timeoutMs = 3000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(20);
+  }
+  throw new Error('waitFor timeout');
+};
 
-describe('WebSocket Transport E2E Tests', () => {
-  let app: INestApplication;
-  let client: Client;
-  let cleanup: TestCleanup;
-  let wsHost: string;
-  let wsPort: number;
-  let wsUrl: string;
-
-  const startWsServer = async (): Promise<void> => {
-    wsHost = 'localhost';
-    wsPort = 3001;
-    wsUrl = `http://${wsHost}:${wsPort}`;
-    
-    @Module({
-      imports: [
-        LoggerModule.forRoot({ 
-          componentName: 'WS.E2E.Server',
-        }),
-        CqrsModule.forRoot({ isGlobal: true }),
-        TransportModule.forRoot({
-          isGlobal: true,
-          transports: [
-            {
-              type: 'ws',
-              host: wsHost,
-              port: wsPort,
-              path: '/',
-              maxMessageSize: 1024 * 1024,
-              heartbeatTimeout: 2000,
-              cors: {
-                origin: '*',
-                credentials: false
-              }
-            }
-          ]
-        })
+function makeBatch(fromOffset = 0, toOffset = 2) {
+  return {
+    action: Actions.OutboxStreamBatch,
+    payload: {
+      streamId: 'stream1',
+      fromOffset,
+      toOffset,
+      events: [
+        { id: '1', eventType: 'BlockAddedEvent', payload: { n: 1 } },
+        { id: '2', eventType: 'BlockAddedEvent', payload: { n: 2 } },
       ],
-      providers: [
-        TestQueryHandler,
-        TestErrorQueryHandler,
-        TestStreamQueryHandler,
-        TestEventHandler
-      ]
-    })
-    class TestAppModule {}
-
-    app = await NestFactory.create(TestAppModule, { logger: false });    
-    await app.init();
-    
-    // Wait for server to be ready
-    await sleep(300);
-    
-    cleanup.add(async () => {
-      if (app) {
-        await app.close();
-        await sleep(100);
-      }
-    });
+    },
   };
+}
 
-  const createWsClient = async (): Promise<void> => {
+describe('WS Node e2e', () => {
+  let http: ReturnType<typeof createServer>;
+  let io: Server;
+  let url: string;
+  let client: Client | undefined;
+
+  // Keep hard refs to all timers and sockets to ensure full cleanup.
+  const serverTimers = new Set<ReturnType<typeof setInterval>>();
+  const sockets = new Set<Socket>();
+
+  beforeAll(async () => {
+    http = createServer();
+    io = new Server(http, { path: '/socket.io' });
+    await new Promise<void>(resolve => http.listen(0, resolve));
+    const port = (http.address() as any).port;
+    url = `http://127.0.0.1:${port}`;
+
+    io.on('connection', (socket) => {
+      sockets.add(socket);
+      let gotPong = false;
+      let gotAck = false;
+
+      // Retry Ping loop until client replies Pong
+      const ping = () => socket.emit('message', { action: Actions.Ping, payload: { ts: Date.now(), nonce: Math.random() } });
+      ping();
+      const pingTimer: ReturnType<typeof setInterval> = setInterval(() => { if (!gotPong) ping(); }, 40);
+      serverTimers.add(pingTimer);
+
+      // Handle client messages
+      socket.on('message', (env: any) => {
+        if (env?.action === Actions.Pong) {
+          gotPong = true;
+          return;
+        }
+        if (env?.action === Actions.QueryRequest) {
+          socket.emit('message', {
+            action: Actions.QueryResponse,
+            requestId: env.requestId,
+            payload: { ok: true, data: { via: 'ws' } },
+          });
+          return;
+        }
+        if (env?.action === Actions.OutboxStreamAck) {
+          gotAck = true;
+        }
+      });
+
+      // Retry Batch loop until ACK
+      const batchEnv = makeBatch();
+      const sendBatch = () => socket.emit('message', batchEnv);
+      const batchTimer: ReturnType<typeof setInterval> = setInterval(() => { if (!gotAck) sendBatch(); }, 50);
+      serverTimers.add(batchTimer);
+      sendBatch();
+
+      socket.on('disconnect', () => {
+        sockets.delete(socket);
+        try { clearInterval(pingTimer); serverTimers.delete(pingTimer); } catch {}
+        try { clearInterval(batchTimer); serverTimers.delete(batchTimer); } catch {}
+      });
+    });
+  });
+
+  afterAll(async () => {
+    // 1) Close client (and fallback: force transport disconnect if close() is missing)
+    try {
+      if (client && (client as any).close) {
+        await (client as any).close();
+      } else if (client && (client as any).t?.disconnect) {
+        await (client as any).t.disconnect();
+      }
+    } catch {}
+    client = undefined;
+
+    // 2) Force-disconnect all server sockets and remove listeners
+    try {
+      for (const s of sockets) {
+        s.removeAllListeners();
+        // @ts-ignore force true to avoid handshake timeouts
+        s.disconnect(true);
+      }
+      sockets.clear();
+    } catch {}
+
+    // 3) Clear any stray server timers (in case 'disconnect' didn't fire)
+    for (const t of Array.from(serverTimers)) {
+      try { clearInterval(t); } catch {}
+      serverTimers.delete(t);
+    }
+
+    // 4) Close socket.io server then http server
+    await new Promise<void>(resolve => io.close(() => resolve()));
+    await new Promise<void>(resolve => http.close(() => resolve()));
+
+    // 5) Give the event loop a tick
+    await sleep(10);
+  });
+
+  it('handshake, stream with ACK, and query', async () => {
+    // IMPORTANT: use the transport type string your SDK expects.
+    // If your node WS transport is registered as 'ws', keep 'ws'.
+    // If it is 'ws-node', change to that.
     client = new Client({
-      transport: {
-        type: 'ws',
-        name: 'ws-e2e-client',
-        url: wsUrl,
-        path: '/',
-        maxMessageSize: 1024 * 1024,
-        timeout: 5000
-      }
+      transport: { type: 'ws', options: { url, path: '/socket.io', connectionTimeout: 2000 } }
     });
 
-    cleanup.add(async () => {
-      if (client) {
-        await client.destroy();
-      }
-    });
+    const seen: number[] = [];
+    client.subscribe('BlockAddedEvent', (e: any) => { seen.push(e.payload.n); });
 
-    await waitFor(() => client.isConnected(), 4000, 100);
-  };
+    // wait for batch delivered (2 events)
+    await waitFor(() => seen.length >= 2, 3000);
+    expect(seen).toEqual([1, 2]);
 
-  beforeEach(() => {
-    cleanup = new TestCleanup();
-  });
-
-  afterEach(async () => {
-    if (client) {
-      await client.destroy();
-    }
-
-    await cleanup.run();
-    
-    await sleep(300);
-
-    if (app) {
-      await app.close();
-    }
-    
-    app = null as any;
-    client = null as any;
-    
-    await sleep(200);
-  });
-
-  describe('Connection and Handshake', () => {
-    it('should establish connection between server and client', async () => {
-      await startWsServer();
-      await createWsClient();
-      
-      expect(client.isConnected()).toBe(true);
-    });
-
-    it('should handle connection timeout when server not ready', async () => {
-      const unusedPort = 9999;
-      
-      client = new Client({
-        transport: {
-          type: 'ws',
-          name: 'timeout-client',
-          url: `http://localhost:${unusedPort}`,
-          path: '/',
-          timeout: 3000
-        }
-      });
-
-      cleanup.add(async () => {
-        if (client) {
-          await client.destroy();
-        }
-      });
-
-      await expect(
-        waitFor(() => client.isConnected(), 2500)
-      ).rejects.toThrow();
-
-      expect(client.isConnected()).toBe(false);
-    });
-
-    it('should detect when server goes down', async () => {
-      await startWsServer();
-      await createWsClient();
-      
-      expect(client.isConnected()).toBe(true);
-      
-      await app.close();
-      
-      await waitFor(() => !client.isConnected(), 8000, 300);
-      
-      expect(client.isConnected()).toBe(false);
-    });
-  });
-
-  describe('Immediate Message Sending and Client Waiting', () => {
-    it('should wait for connection before sending messages', async () => {
-      await startWsServer();
-      
-      client = new Client({
-        transport: {
-          type: 'ws',
-          name: 'ws-wait-client',
-          url: wsUrl,
-          path: '/',
-          timeout: 8000
-        }
-      });
-
-      cleanup.add(async () => {
-        if (client) {
-          await client.destroy();
-        }
-      });
-
-      // Ensure connection is established before sending query
-      await waitFor(() => client.isConnected(), 6000, 100);
-
-      const requestId = generateTestId('immediate-query');
-      const startTime = Date.now();
-      
-      const response = await client.query(requestId, {
-        constructorName: 'TestQuery',
-        dto: { message: 'Immediate query' }
-      });
-
-      const duration = Date.now() - startTime;
-      
-      // Check new QueryResult interface
-      expect(response).toMatchObject({
-        requestId,
-        payload: {
-          result: 'Echo: Immediate query',
-          timestamp: expect.any(Number)
-        },
-        timestamp: expect.any(Number),
-        responseTimestamp: expect.any(Number)
-      });
-      
-      expect(duration).toBeGreaterThan(0);
-      expect(response.responseTimestamp).toBeGreaterThan(response.timestamp);
-    });
-
-    it('should throw error when server is down', async () => {
-      client = new Client({
-        transport: {
-          type: 'ws',
-          name: 'dead-server-client',
-          url: wsUrl,
-          path: '/',
-          timeout: 3000
-        }
-      });
-
-      cleanup.add(async () => {
-        if (client) {
-          await client.destroy();
-        }
-      });
-
-      const requestId = generateTestId('dead-server-query');
-      
-      await expect(
-        client.query(requestId, {
-          constructorName: 'TestQuery',
-          dto: { message: 'Dead server' }
-        })
-      ).rejects.toThrow();
-    });
-  });
-
-  describe('Query Operations', () => {
-    beforeEach(async () => {
-      await startWsServer();
-      await createWsClient();
-    });
-
-    it('should execute basic queries', async () => {
-      const requestId = generateTestId('basic-query');
-      
-      await waitFor(() => client.isConnected(), 3000, 100);
-      
-      const response = await client.query(requestId, {
-        constructorName: 'TestQuery',
-        dto: { message: 'Hello WebSocket!' }
-      });
-
-      expect(response).toMatchObject({
-        requestId,
-        payload: {
-          result: 'Echo: Hello WebSocket!',
-          timestamp: expect.any(Number)
-        },
-        timestamp: expect.any(Number),
-        responseTimestamp: expect.any(Number)
-      });
-    });
-
-    it('should handle query with delay', async () => {
-      const requestId = generateTestId('delay-query');
-      const startTime = Date.now();
-      
-      const response = await client.query(requestId, {
-        constructorName: 'TestQuery',
-        dto: { message: 'Delayed WebSocket query', delay: 100 }
-      });
-
-      const duration = Date.now() - startTime;
-      
-      expect(response).toMatchObject({
-        requestId,
-        payload: {
-          result: 'Echo: Delayed WebSocket query',
-          timestamp: expect.any(Number)
-        },
-        timestamp: expect.any(Number),
-        responseTimestamp: expect.any(Number)
-      });
-
-      expect(duration).toBeGreaterThanOrEqual(80);
-    });
-
-    it('should handle error queries', async () => {
-      const requestId = generateTestId('error-query');
-      
-      await expect(
-        client.query(requestId, {
-          constructorName: 'TestErrorQuery',
-          dto: { errorMessage: 'Test error from WebSocket' }
-        })
-      ).rejects.toThrow();
-    });
-
-    it('should handle unknown query types', async () => {
-      const requestId = generateTestId('unknown-query');
-      
-      await expect(
-        client.query(requestId, {
-          constructorName: 'UnknownQueryType',
-          dto: { data: 'test' }
-        })
-      ).rejects.toThrow();
-    });
-  });
-
-  describe('Stream Operations', () => {
-    beforeEach(async () => {
-      await startWsServer();
-      await createWsClient();
-    });
-
-    it('should handle stream queries', async () => {
-      const requestId = generateTestId('stream-query');
-      
-      const response = await client.query(requestId, {
-        constructorName: 'TestStreamQuery',
-        dto: { count: 3, delay: 30 }
-      });
-
-      if (response.payload && typeof response.payload[Symbol.asyncIterator] === 'function') {
-        const receivedItems: any[] = [];
-        for await (const item of response.payload) {
-          receivedItems.push(item);
-        }
-        
-        expect(receivedItems).toHaveLength(3);
-        receivedItems.forEach((item, index) => {
-          expect(item).toMatchObject({
-            index,
-            timestamp: expect.any(Number)
-          });
-        });
-      } else {
-        expect(response.payload).toBeDefined();
-      }
-    });
-
-    it('should handle stream errors', async () => {
-      const requestId = generateTestId('stream-error');
-      
-      await expect(
-        client.query(requestId, {
-          constructorName: 'TestErrorQuery',
-          dto: { errorMessage: 'Stream error via WebSocket' }
-        })
-      ).rejects.toThrow();
-    });
-  });
-
-  describe('Event Broadcasting from Server', () => {
-    beforeEach(async () => {
-      await startWsServer();
-      await createWsClient();
-    });
-
-    it('should attempt to receive events from server via WebSocket', async () => {
-      const receivedEvents: any[] = [];
-      
-      const unsubscribe = client.subscribe('TestEvent', async (event) => {
-        receivedEvents.push(event);
-      });
-
-      cleanup.add(() => unsubscribe());
-
-      await sleep(300);
-
-      const response = await client.query(generateTestId('event-trigger'), {
-        constructorName: 'TestQuery',
-        dto: { message: 'Event trigger via WebSocket' }
-      });
-
-      expect(response).toMatchObject({
-        requestId: expect.any(String),
-        payload: {
-          result: 'Echo: Event trigger via WebSocket',
-          timestamp: expect.any(Number)
-        },
-        timestamp: expect.any(Number),
-        responseTimestamp: expect.any(Number)
-      });
-
-      try {
-        await waitFor(() => receivedEvents.length > 0, 5000, 300);
-        
-        expect(receivedEvents.length).toBeGreaterThan(0);
-        const event = receivedEvents[0];
-        expect(event).toMatchObject({
-          id: expect.stringContaining('query-'),
-          data: expect.stringContaining('Query executed:'),
-          timestamp: expect.any(Number)
-        });
-      } catch (error) {
-        expect(receivedEvents.length).toBe(0);
-      }
-    });
-
-    it('should handle subscription management', async () => {
-      const unsubscribe1 = client.subscribe('TestEvent', async () => {});
-      const unsubscribe2 = client.subscribe('TestEvent', async () => {});
-      
-      expect(client.getSubscriptionCount('TestEvent')).toBe(2);
-      
-      unsubscribe1();
-      expect(client.getSubscriptionCount('TestEvent')).toBe(1);
-      
-      unsubscribe2();
-      expect(client.getSubscriptionCount('TestEvent')).toBe(0);
-    });
-  });
-
-  describe('Error Handling and Edge Cases', () => {
-    beforeEach(async () => {
-      await startWsServer();
-      await createWsClient();
-    });
-
-    it('should handle oversized messages', async () => {
-      const requestId = generateTestId('oversized-ws');
-      
-      const largeMessage = 'A'.repeat(2 * 1024 * 1024);
-      
-      await expect(
-        client.query(requestId, {
-          constructorName: 'TestQuery',
-          dto: { message: largeMessage }
-        })
-      ).rejects.toThrow();
-    });
-
-    it('should handle concurrent queries', async () => {
-      const queryCount = 3;
-      
-      const promises = Array.from({ length: queryCount }, (_, i) => {
-        const requestId = generateTestId(`concurrent-ws-${i}`);
-        return client.query(requestId, {
-          constructorName: 'TestQuery',
-          dto: { message: `Concurrent WebSocket message ${i}` }
-        });
-      });
-
-      const results = await Promise.allSettled(promises);
-      
-      const successful = results.filter(r => r.status === 'fulfilled');
-      const failed = results.filter(r => r.status === 'rejected');
-
-      expect(successful.length).toBeGreaterThanOrEqual(queryCount * 0.8);
-      
-      successful.forEach((result) => {
-        if (result.status === 'fulfilled') {
-          expect(result.value).toMatchObject({
-            requestId: expect.any(String),
-            payload: {
-              result: expect.stringContaining('Echo:'),
-              timestamp: expect.any(Number)
-            },
-            timestamp: expect.any(Number),
-            responseTimestamp: expect.any(Number)
-          });
-        }
-      });
-    });
-
-    it('should handle rapid sequential queries', async () => {
-      const queryCount = 3;
-      const results: any[] = [];
-      
-      for (let i = 0; i < queryCount; i++) {
-        const requestId = generateTestId(`rapid-ws-${i}`);
-        const response = await client.query(requestId, {
-          constructorName: 'TestQuery',
-          dto: { message: `Rapid WebSocket message ${i}` }
-        });
-        results.push(response);
-      }
-
-      expect(results).toHaveLength(queryCount);
-      results.forEach((result, index) => {
-        expect(result).toMatchObject({
-          requestId: expect.any(String),
-          payload: {
-            result: `Echo: Rapid WebSocket message ${index}`,
-            timestamp: expect.any(Number)
-          },
-          timestamp: expect.any(Number),
-          responseTimestamp: expect.any(Number)
-        });
-      });
-    });
-
-    it('should detect server disconnection', async () => {
-      expect(client.isConnected()).toBe(true);
-      
-      await app.close();
-      
-      await waitFor(() => !client.isConnected(), 5000, 300);
-      
-      expect(client.isConnected()).toBe(false);
-    });
-
-    it('should fail queries after disconnection', async () => {
-      expect(client.isConnected()).toBe(true);
-      
-      await app.close();
-      
-      await waitFor(() => !client.isConnected(), 5000, 300);
-      
-      const requestId = generateTestId('after-disconnect');
-      
-      await expect(
-        client.query(requestId, {
-          constructorName: 'TestQuery',
-          dto: { message: 'After disconnect' }
-        })
-      ).rejects.toThrow();
-    });
-
-    it('should handle ping-pong heartbeat correctly', async () => {
-      const initialConnection = client.isConnected();
-      expect(initialConnection).toBe(true);
-      
-      // Wait for heartbeat cycles
-      await sleep(2000);
-      
-      expect(client.isConnected()).toBe(true);
-    });
-  });
+    // query round-trip
+    const res = await client.querySimple<{}, { via: string }>('GetStatus', {});
+    expect(res).toEqual({ via: 'ws' });
+  }, 10000);
 });

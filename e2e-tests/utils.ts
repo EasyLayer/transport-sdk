@@ -1,53 +1,32 @@
-export class TestCleanup {
-  private fns: Array<() => Promise<void> | void> = [];
+import net from 'node:net';
 
-  add(fn: () => Promise<void> | void) { this.fns.push(fn); }
+export function deferred<T = void>() {
+  let resolve!: (v: T | PromiseLike<T>) => void;
+  let reject!: (e?: any) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
 
-  async run() {
-    for (const fn of this.fns.reverse()) {
-      try { await fn(); } catch { /* ignore */ }
-    }
-    this.fns.length = 0;
+/** Waits until predicate returns truthy or times out. */
+export async function waitFor(pred: () => boolean, timeoutMs = 5_000, stepMs = 20) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pred()) return;
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, stepMs));
   }
+  throw new Error('waitFor timeout');
 }
 
-
-export async function waitFor(
-  condition: () => boolean, 
-  timeoutMs: number = 2000, 
-  intervalMs: number = 50
-): Promise<void> {
-  const startTime = Date.now();
-  
-  return new Promise((resolve, reject) => {
-    const check = () => {
-      if (condition()) {
-        resolve();
-        return;
-      }
-      
-      if (Date.now() - startTime > timeoutMs) {
-        reject(new Error(`Timeout after ${timeoutMs}ms waiting for condition`));
-        return;
-      }
-      
-      setTimeout(check, intervalMs);
-    };
-    
-    check();
-  });
-}
-
-export function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-export function generateTestId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-}
-
-export function timeout(ms: number): Promise<never> {
-  return new Promise((_, reject) => {
-    setTimeout(() => reject(new Error(`Operation timed out after ${ms}ms`)), ms);
+/** Allocates a free TCP port by binding to 0 and closing. */
+export async function getFreePort(): Promise<number> {
+  return await new Promise<number>((resolve, reject) => {
+    const srv = net.createServer();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      const port = typeof addr === 'object' && addr ? addr.port : 0;
+      srv.close(() => resolve(port));
+    });
   });
 }

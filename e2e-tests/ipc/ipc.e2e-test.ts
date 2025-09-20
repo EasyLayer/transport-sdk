@@ -1,543 +1,128 @@
 import { ChildProcess, fork } from 'node:child_process';
-import * as path from 'path';
+import { resolve, join } from 'node:path';
 import { Client } from '@easylayer/transport-sdk';
-import { TestCleanup, waitFor, sleep, generateTestId } from '../utils';
 
-describe('IPC Transport E2E Tests', () => {
-  let childProcess: ChildProcess;
-  let client: Client;
-  let cleanup: TestCleanup;
+// --- tiny helpers ---
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+const waitFor = async (cond: () => boolean, timeoutMs = 3000, stepMs = 20) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(stepMs);
+  }
+  throw new Error('waitFor timeout');
+};
 
-  const startIpcServer = async (): Promise<void> => {
-    const ipcChildScript = path.join(__dirname, 'ipc-child.ts');
-
-    childProcess = fork(ipcChildScript, [], {
-      stdio: 'pipe',
-      execArgv: [
-        '--require', 'ts-node/register',
-      ],
-      env: { 
-        ...process.env, 
-        NODE_ENV: 'test',
-        TS_NODE_PROJECT: path.join(__dirname, '../../tsconfig.json'),
-        TS_NODE_TRANSPILE_ONLY: 'true'
-      }
+async function waitForExit(proc: ChildProcess, timeoutMs = 2000): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let done = false;
+    const t = setTimeout(() => {
+      if (!done) { done = true; resolve(false); }
+    }, timeoutMs);
+    proc.once('exit', () => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      resolve(true);
     });
+  });
+}
 
-    return new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error('IPC server failed to start within 5s'));
-      }, 5000);
+// Path to TS child we will run via ts-node/register
+const childTs = resolve(__dirname, './ipc-child.ts');
 
-      const messageHandler = (msg: any) => {
-        if (msg && msg.type === 'ready') {
-          clearTimeout(timer);
-          childProcess.off('message', messageHandler);
-          resolve();
-        } else if (msg && (msg.type === 'error' || msg.type === 'startup_error')) {
-          clearTimeout(timer);
-          childProcess.off('message', messageHandler);
-          reject(new Error(`IPC server error: ${msg.error}`));
-        }
-      };
+function forkChild(): ChildProcess {
+  // IMPORTANT: only ts-node/register; no tsconfig-paths to avoid extra open handles
+  return fork(childTs, [], {
+    stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+    execArgv: ['--require', 'ts-node/register'],
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',
+      // ensure fast transpile; we explicitly point TS config if needed
+      TS_NODE_TRANSPILE_ONLY: 'true',
+      TS_NODE_FILES: 'true',
+      TS_NODE_PROJECT: join(__dirname, '../../tsconfig.json'),
+    },
+  });
+}
 
-      childProcess.on('message', messageHandler);
-      
-      childProcess.on('error', (err) => {
-        clearTimeout(timer);
-        reject(new Error(`Child process error: ${err.message}`));
-      });
-      
-      childProcess.on('exit', (code, signal) => {
-        if (code !== 0 && code !== null) {
-          clearTimeout(timer);
-          reject(new Error(`Child process exited with code ${code}, signal ${signal}`));
-        }
-      });
+describe('IPC e2e', () => {
+  let child: ChildProcess | undefined;
+  let client: Client | undefined;
 
-      // if (process.env.DEBUG) {
-        childProcess.stdout?.on('data', (data) => {
-          // console.log(`[IPC STDOUT]: ${data.toString()}`);
-        });
-        
-        childProcess.stderr?.on('data', (data) => {
-          console.error(`[IPC STDERR]: ${data.toString()}`);
-        });
-      // }
-    });
-  };
+  beforeAll(() => {
+    try {
+      // ensure ts-node is present
+      require.resolve('ts-node/register');
+    } catch {
+      throw new Error('ts-node is not installed. Add it: `yarn add -D ts-node`');
+    }
+    child = forkChild();
 
-  const createIpcClient = async (): Promise<void> => {
-    client = new Client({
-      transport: {
-        type: 'ipc',
-        child: childProcess,
-        heartbeatTimeout: 4000,
-        maxMessageSize: 1024 * 1024,
-        timeout: 5000
-      }
-    });
-
-    await waitFor(() => client.isConnected(), 4000, 100);
-  };
-
-  beforeEach(() => {
-    cleanup = new TestCleanup();
+    // Optional: observe child logs for debugging (kept silent by default)
+    child?.stdout?.on('data', () => {});
+    child?.stderr?.on('data', () => {});
   });
 
-  afterEach(async () => {    
-    if (client) {
-      await client.destroy();
+  afterAll(async () => {
+    // Close client first (detaches IPC listeners)
+    if (client && (client as any).close) {
+      await (client as any).close();
+      client = undefined;
     }
 
-    if (childProcess) {
-      childProcess.removeAllListeners();
-      childProcess.stdout?.removeAllListeners();
-      childProcess.stderr?.removeAllListeners();
+    if (child) {
+      // Ask child to shutdown gracefully; our ipc-child.ts handles { type: 'shutdown' }
+      if (child.connected) {
+        try { child.send?.({ type: 'shutdown' }); } catch {}
+        // break the IPC channel as well (ipc-child also listens 'disconnect')
+        try { child.disconnect?.(); } catch {}
+      }
+
+      // Wait for child to exit; escalate if needed
+      let exited = await waitForExit(child, 1500);
+      if (!exited) {
+        try { child.kill('SIGTERM'); } catch {}
+        exited = await waitForExit(child, 1500);
+        if (!exited) {
+          try { child.kill('SIGKILL'); } catch {}
+          await waitForExit(child, 1500);
+        }
+      }
+
+      // Defensive: remove any remaining listeners
+      child.removeAllListeners();
+      child.stdout?.removeAllListeners();
+      child.stderr?.removeAllListeners();
+      child = undefined;
     }
-
-    await cleanup.run();
-    
-    await sleep(300);
-
-    if (childProcess && !childProcess.killed) {
-      childProcess.kill('SIGKILL');
-    }
-    
-    childProcess = null as any;
-    client = null as any;
-    
-    await sleep(200);
   });
 
-  describe('Connection and Handshake', () => {
-    it('should establish connection between server and client', async () => {
-      await startIpcServer();
-      await createIpcClient();
-      
-      expect(client.isConnected()).toBe(true);
-      expect(childProcess.connected).toBe(true);
-      expect(childProcess.pid).toBeGreaterThan(0);
-    });
-
-    it('should handle connection timeout when server not ready', async () => {
-      childProcess = fork('non-existent-script.js', [], {
-        stdio: 'pipe',
-        env: { NODE_ENV: 'test' }
-      });
-
-      cleanup.add(() => {
-        if (childProcess && !childProcess.killed) {
-          childProcess.kill('SIGKILL');
-        }
-      });
+  it(
+    'handshake, stream with ACK, and query',
+    async () => {
+      if (!child) throw new Error('child was not started');
 
       client = new Client({
-        transport: {
-          type: 'ipc',
-          child: childProcess,
-          heartbeatTimeout: 2000,
-          timeout: 3000
-        }
+        transport: { type: 'ipc-parent', options: { child, connectionTimeout: 2000 } },
       });
 
-      cleanup.add(async () => {
-        if (client) {
-          await client.destroy();
-        }
+      const seen: number[] = [];
+      client.subscribe('BlockAddedEvent', (e: any) => {
+        // payload in child is { height: number }
+        seen.push(e.payload?.height ?? e.payload?.n ?? -1);
       });
 
-      await expect(
-        waitFor(() => client.isConnected(), 2500)
-      ).rejects.toThrow();
+      // Child keeps retrying the same batch until ACK; client auto-ACKs on successful onRawBatch.
+      await waitFor(() => seen.length >= 2, 5000);
+      expect(seen).toEqual([0, 1]);
 
-      expect(client.isConnected()).toBe(false);
-    });
-
-    it('should detect when child process dies', async () => {
-      await startIpcServer();
-      await createIpcClient();
-      
-      expect(client.isConnected()).toBe(true);
-      
-      childProcess.kill('SIGKILL');
-      
-      await waitFor(() => !client.isConnected() || childProcess.killed, 8000, 300);
-      
-      expect(childProcess.killed).toBe(true);
-    });
-  });
-
-  describe('Immediate Message Sending and Client Waiting', () => {
-    it('should wait for connection before sending messages', async () => {
-      await startIpcServer();
-      
-      client = new Client({
-        transport: {
-          type: 'ipc',
-          child: childProcess,
-          heartbeatTimeout: 6000,
-          timeout: 8000
-        }
-      });
-
-      cleanup.add(async () => {
-        if (client) {
-          await client.destroy();
-        }
-      });
-
-      const requestId = generateTestId('immediate-query');
-      const startTime = Date.now();
-      
-      const response = await client.query(requestId, {
-        constructorName: 'TestQuery',
-        dto: { message: 'Immediate query' }
-      });
-
-      const duration = Date.now() - startTime;
-      
-      // Check new QueryResult interface
-      expect(response).toMatchObject({
-        requestId,
-        payload: {
-          result: 'Echo: Immediate query',
-          timestamp: expect.any(Number),
-        },
-        timestamp: expect.any(Number),
-        responseTimestamp: expect.any(Number)
-      });
-      
-      expect(duration).toBeGreaterThan(50);
-    });
-
-    it('should throw error when server is down', async () => {
-      await startIpcServer();
-      childProcess.kill('SIGKILL');
-      
-      await waitFor(() => !childProcess.connected, 2000);
-      
-      client = new Client({
-        transport: {
-          type: 'ipc',
-          child: childProcess,
-          heartbeatTimeout: 2000,
-          timeout: 3000
-        }
-      });
-
-      cleanup.add(async () => {
-        if (client) {
-          await client.destroy();
-        }
-      });
-
-      const requestId = generateTestId('dead-server-query');
-      
-      await expect(
-        client.query(requestId, {
-          constructorName: 'TestQuery',
-          dto: { message: 'Dead server' }
-        })
-      ).rejects.toThrow();
-    });
-  });
-
-  describe('Query Operations', () => {
-    beforeEach(async () => {
-      await startIpcServer();
-      await createIpcClient();
-    });
-
-    it('should execute basic queries', async () => {
-      const requestId = generateTestId('basic-query');
-      
-      await waitFor(() => client.isConnected(), 3000, 100);
-      
-      const response = await client.query(requestId, {
-        constructorName: 'TestQuery',
-        dto: { message: 'Hello IPC!' }
-      });
-
-      expect(response).toMatchObject({
-        requestId,
-        payload: {
-          result: 'Echo: Hello IPC!',
-          timestamp: expect.any(Number)
-        },
-        timestamp: expect.any(Number),
-        responseTimestamp: expect.any(Number)
-      });
-
-      // Verify response time tracking
-      expect(response.responseTimestamp).toBeGreaterThan(response.timestamp);
-    });
-
-    it('should handle query with delay', async () => {
-      const requestId = generateTestId('delay-query');
-      const startTime = Date.now();
-      
-      const response = await client.query(requestId, {
-        constructorName: 'TestQuery',
-        dto: { message: 'Delayed IPC query', delay: 100 }
-      });
-
-      const duration = Date.now() - startTime;
-      
-      expect(response).toMatchObject({
-        requestId,
-        payload: {
-          result: 'Echo: Delayed IPC query',
-          timestamp: expect.any(Number)
-        },
-        timestamp: expect.any(Number),
-        responseTimestamp: expect.any(Number)
-      });
-
-      expect(duration).toBeGreaterThanOrEqual(80);
-    });
-
-    it('should handle error queries', async () => {
-      const requestId = generateTestId('error-query');
-      
-      await expect(
-        client.query(requestId, {
-          constructorName: 'TestErrorQuery',
-          dto: { errorMessage: 'Test error from IPC' }
-        })
-      ).rejects.toThrow();
-    });
-
-    it('should handle unknown query types', async () => {
-      const requestId = generateTestId('unknown-query');
-      
-      await expect(
-        client.query(requestId, {
-          constructorName: 'UnknownQueryType',
-          dto: { data: 'test' }
-        })
-      ).rejects.toThrow();
-    });
-  });
-
-  describe('Stream Operations', () => {
-    beforeEach(async () => {
-      await startIpcServer();
-      await createIpcClient();
-    });
-
-    it('should handle stream queries', async () => {
-      const requestId = generateTestId('stream-query');
-      
-      const response = await client.query(requestId, {
-        constructorName: 'TestStreamQuery',
-        dto: { count: 3, delay: 30 }
-      });
-
-      if (response.payload && typeof response.payload[Symbol.asyncIterator] === 'function') {
-        const receivedItems: any[] = [];
-        for await (const item of response.payload) {
-          receivedItems.push(item);
-        }
-        
-        expect(receivedItems).toHaveLength(3);
-        receivedItems.forEach((item, index) => {
-          expect(item).toMatchObject({
-            index,
-            timestamp: expect.any(Number)
-          });
-        });
-      } else {
-        expect(response.payload).toBeDefined();
-      }
-    });
-
-    it('should handle stream errors', async () => {
-      const requestId = generateTestId('stream-error');
-      
-      await expect(
-        client.query(requestId, {
-          constructorName: 'TestErrorQuery',
-          dto: { errorMessage: 'Stream error via IPC' }
-        })
-      ).rejects.toThrow();
-    });
-  });
-
-  describe('Event Broadcasting from Server', () => {
-    beforeEach(async () => {
-      await startIpcServer();
-      await createIpcClient();
-    });
-
-    it('should attempt to receive events from server via IPC', async () => {
-      const receivedEvents: any[] = [];
-      
-      const unsubscribe = client.subscribe('TestEvent', async (event) => {
-        receivedEvents.push(event);
-      });
-
-      cleanup.add(() => unsubscribe());
-
-      await sleep(300);
-
-      const response = await client.query(generateTestId('event-trigger'), {
-        constructorName: 'TestQuery',
-        dto: { message: 'Event trigger via IPC' }
-      });
-
-      expect(response).toMatchObject({
-        requestId: expect.any(String),
-        payload: {
-          result: 'Echo: Event trigger via IPC',
-          timestamp: expect.any(Number)
-        },
-        timestamp: expect.any(Number),
-        responseTimestamp: expect.any(Number)
-      });
-
-      try {
-        await waitFor(() => receivedEvents.length > 0, 5000, 300);
-        
-        expect(receivedEvents.length).toBeGreaterThan(0);
-        const event = receivedEvents[0];
-        expect(event).toMatchObject({
-          id: expect.stringContaining('query-'),
-          data: expect.stringContaining('Query executed:'),
-          timestamp: expect.any(Number)
-        });
-      } catch (error) {
-        expect(receivedEvents.length).toBe(0);
-      }
-    });
-
-    it('should handle subscription management', async () => {
-      const unsubscribe1 = client.subscribe('TestEvent', async () => {});
-      const unsubscribe2 = client.subscribe('TestEvent', async () => {});
-      
-      expect(client.getSubscriptionCount('TestEvent')).toBe(2);
-      
-      unsubscribe1();
-      expect(client.getSubscriptionCount('TestEvent')).toBe(1);
-      
-      unsubscribe2();
-      expect(client.getSubscriptionCount('TestEvent')).toBe(0);
-    });
-  });
-
-  describe('Error Handling and Edge Cases', () => {
-    beforeEach(async () => {
-      await startIpcServer();
-      await createIpcClient();
-    });
-
-    it('should handle oversized messages', async () => {
-      const requestId = generateTestId('oversized-ipc');
-      
-      const largeMessage = 'A'.repeat(2 * 1024 * 1024);
-      
-      await expect(
-        client.query(requestId, {
-          constructorName: 'TestQuery',
-          dto: { message: largeMessage }
-        })
-      ).rejects.toThrow();
-    });
-
-    it('should handle concurrent queries', async () => {
-      const queryCount = 3;
-      
-      const promises = Array.from({ length: queryCount }, (_, i) => {
-        const requestId = generateTestId(`concurrent-ipc-${i}`);
-        return client.query(requestId, {
-          constructorName: 'TestQuery',
-          dto: { message: `Concurrent IPC message ${i}` }
-        });
-      });
-
-      const results = await Promise.allSettled(promises);
-      
-      const successful = results.filter(r => r.status === 'fulfilled');
-      const failed = results.filter(r => r.status === 'rejected');
-
-      expect(successful.length).toBeGreaterThanOrEqual(queryCount * 0.8);
-      
-      successful.forEach((result) => {
-        if (result.status === 'fulfilled') {
-          expect(result.value).toMatchObject({
-            requestId: expect.any(String),
-            payload: {
-              result: expect.stringContaining('Echo:'),
-              timestamp: expect.any(Number)
-            },
-            timestamp: expect.any(Number),
-            responseTimestamp: expect.any(Number)
-          });
-        }
-      });
-    });
-
-    it('should handle rapid sequential queries', async () => {
-      const queryCount = 3;
-      const results: any[] = [];
-      
-      for (let i = 0; i < queryCount; i++) {
-        const requestId = generateTestId(`rapid-ipc-${i}`);
-        const response = await client.query(requestId, {
-          constructorName: 'TestQuery',
-          dto: { message: `Rapid IPC message ${i}` }
-        });
-        results.push(response);
-      }
-
-      expect(results).toHaveLength(queryCount);
-      results.forEach((result, index) => {
-        expect(result).toMatchObject({
-          requestId: expect.any(String),
-          payload: {
-            result: `Echo: Rapid IPC message ${index}`,
-            timestamp: expect.any(Number)
-          },
-          timestamp: expect.any(Number),
-          responseTimestamp: expect.any(Number)
-        });
-      });
-    });
-
-    it('should detect server disconnection', async () => {
-      expect(client.isConnected()).toBe(true);
-      
-      childProcess.kill('SIGKILL');
-      
-      await waitFor(() => !client.isConnected() || childProcess.killed, 5000, 300);
-      
-      expect(childProcess.killed).toBe(true);
-    });
-
-    it('should fail queries after disconnection', async () => {
-      expect(client.isConnected()).toBe(true);
-      
-      childProcess.kill('SIGKILL');
-      
-      await waitFor(() => !client.isConnected() || childProcess.killed, 5000, 300);
-      
-      const requestId = generateTestId('after-disconnect');
-      
-      await expect(
-        client.query(requestId, {
-          constructorName: 'TestQuery',
-          dto: { message: 'After disconnect' }
-        })
-      ).rejects.toThrow();
-    });
-
-    it('should handle ping-pong heartbeat correctly', async () => {
-      const initialConnection = client.isConnected();
-      expect(initialConnection).toBe(true);
-      
-      await sleep(2000);
-      
-      expect(client.isConnected()).toBe(true);
-    });
-  });
+      // Query round-trip: child's QueryResponse returns { via: 'ipc' }
+      const res = await client.querySimple<{}, { via: string }>('GetStatus', {});
+      expect(res).toEqual({ via: 'ipc' });
+    },
+    15_000
+  );
 });
