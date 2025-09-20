@@ -1,264 +1,230 @@
 import type { Socket } from 'socket.io-client';
 import { io } from 'socket.io-client';
-import type { BaseTransportOptions } from '../core/transport';
-import { BaseTransport } from '../core/transport';
-import {
-  ConnectionError,
-  TimeoutError,
-  TransportInitError,
-  DestroyError,
-  MESSAGE_SIZE_LIMITS,
-  DEFAULT_HEARTBEAT_TIMEOUT_MS,
-  validateMessageSize,
-  MessageError,
+import type {
+  Transport,
+  TransportOptions,
+  Envelope,
+  RegisterStreamConsumerPayload,
+  RpcRequestPayload,
+  RpcResponsePayload,
+  OutboxStreamBatchPayload,
+  OutboxStreamAckPayload,
+  WireEventRecord,
+  ExpIntervalController,
+  BatchHandler,
+  BatchContext,
 } from '../shared';
-import type { IncomingMessage } from '../shared';
+import { Actions, uuid, TRANSPORT_OVERHEAD_WIRE, utf8Len, exponentialIntervalAsync } from '../shared';
 
-export interface WsClientOptions extends BaseTransportOptions {
-  type: 'ws';
-  url: string;
-  maxMessageSize?: number;
-  path?: string;
-  ssl?: {
-    enabled?: boolean;
-    rejectUnauthorized?: boolean;
-    ca?: string;
-    cert?: string;
-    key?: string;
-  };
+export interface WsClientOptions extends TransportOptions {
+  url: string; // e.g., "https://host:3001/"
+  path?: string; // e.g., "/"
   transports?: ('websocket' | 'polling')[];
 }
 
-export class WsTransport extends BaseTransport {
+export class WsClientTransport implements Transport {
   private socket: Socket | null = null;
-  private readonly url: string;
-  private readonly path: string;
-  private readonly heartbeatTimeout: number;
-  private readonly maxMessageSize: number;
-  private readonly sslOptions: WsClientOptions['ssl'];
-  private readonly socketTransports: ('websocket' | 'polling')[];
-  private readonly pendings = new Map<
-    string,
-    {
-      resolve: (value: any) => void;
-      reject: (err: any) => void;
-      timer: NodeJS.Timeout;
-    }
-  >();
-  private lastPongTime = 0;
-  private businessConnected = false;
+  private lastPong = 0;
+  private heartbeatCtl: ExpIntervalController | null = null;
 
-  constructor(options: WsClientOptions) {
-    super('ws', options.name ?? 'ws', options);
+  private batchHandler: BatchHandler = async () => {};
+  private readonly maxBytes: number;
+  private readonly hbTimeout: number;
+  private readonly connTimeout: number;
+  private readonly token?: string;
 
-    if (!options.url) {
-      throw new TransportInitError('URL is required for WebSocket transport', {
-        transportType: this.type,
-      });
-    }
-
-    this.url = options.url;
-    this.path = options.path || '/';
-    this.heartbeatTimeout = DEFAULT_HEARTBEAT_TIMEOUT_MS;
-    this.maxMessageSize = options.maxMessageSize ?? MESSAGE_SIZE_LIMITS.WS;
-    this.sslOptions = options.ssl;
-    this.socketTransports = options.transports || ['websocket', 'polling'];
-
-    // Auto-detect SSL from URL if not explicitly set
-    const isSSL = this.sslOptions?.enabled ?? (this.url.startsWith('https://') || this.url.startsWith('wss://'));
-
-    console.log(
-      `[${this.name}] Looking for WebSocket server at ${this.url}${this.path} ${isSSL ? '(SSL)' : '(no SSL)'}`
-    );
-    this.connectWebSocket();
+  constructor(private readonly opts: WsClientOptions) {
+    this.maxBytes = opts.maxMessageBytes ?? 1024 * 1024;
+    this.hbTimeout = opts.heartbeatTimeout ?? 10000;
+    this.connTimeout = opts.connectionTimeout ?? 5000;
+    this.token = opts.token;
   }
 
-  isConnected(): boolean {
-    return this.socket?.connected === true && this.businessConnected;
+  kind(): 'ws' {
+    return 'ws';
   }
 
-  isWebSocketConnected(): boolean {
-    return this.socket?.connected === true;
+  async connect(): Promise<void> {
+    if (this.socket) return;
+
+    const url = this.opts.url;
+    this.socket = io(url, {
+      path: this.opts.path ?? '/',
+      transports: this.opts.transports ?? ['websocket', 'polling'],
+      autoConnect: true,
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      forceNew: true,
+      timeout: this.connTimeout,
+    });
+
+    this.installHandlers(this.socket);
+
+    // Wait up to connectionTimeout for 'connect'
+    const ok = await this.awaitConnected(this.connTimeout);
+    if (!ok) throw new Error('WS connect timeout');
+    // Register as streaming consumer (business identity)
+    await this.sendRegister();
+    this.startHeartbeatLoop();
   }
 
-  isBusinessConnected(): boolean {
-    return this.businessConnected && Date.now() - this.lastPongTime < this.heartbeatTimeout;
-  }
-
-  async destroy(): Promise<void> {
-    this.businessConnected = false;
-
+  async disconnect(): Promise<void> {
+    this.heartbeatCtl?.destroy();
+    this.heartbeatCtl = null;
     if (this.socket) {
       this.socket.removeAllListeners();
       this.socket.disconnect();
       this.socket = null;
     }
-
-    Array.from(this.pendings.values()).forEach((pending) => {
-      clearTimeout(pending.timer);
-      pending.reject(
-        new DestroyError('Transport destroyed', {
-          transportType: this.type,
-        })
-      );
-    });
-    this.pendings.clear();
   }
 
-  protected async forward(msg: IncomingMessage): Promise<void> {
-    if (!this.isWebSocketConnected()) {
-      throw new ConnectionError('WebSocket not connected', {
-        transportType: this.type,
-      });
-    }
-
-    if (!this.isBusinessConnected()) {
-      throw new ConnectionError('Business connection not established (no ping/pong)', {
-        transportType: this.type,
-      });
-    }
-
-    const requestId = `${Date.now()}:${Math.random()}`;
-    const message = { ...msg, requestId };
-    validateMessageSize(message, this.maxMessageSize, this.type, this.name);
-    this.socket!.emit('message', message);
+  isConnectedSync(): boolean {
+    const s = this.socket;
+    if (!s || !s.connected) return false;
+    const age = Date.now() - this.lastPong;
+    return age < this.hbTimeout;
   }
 
-  protected async transmit(msg: IncomingMessage): Promise<any> {
-    if (!this.isWebSocketConnected()) {
-      throw new ConnectionError('WebSocket not connected', {
-        transportType: this.type,
-      });
+  async awaitConnected(timeoutMs: number = this.connTimeout): Promise<boolean> {
+    if (this.isConnectedSync()) return true;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.isConnectedSync()) return true;
+      await new Promise((r) => setTimeout(r, 100));
     }
-
-    if (!this.isBusinessConnected()) {
-      throw new ConnectionError('Business connection not established (no ping/pong)', {
-        transportType: this.type,
-      });
-    }
-
-    const requestId = `${Date.now()}:${Math.random()}`;
-    const message = { ...msg, requestId };
-    validateMessageSize(message, this.maxMessageSize, this.type, this.name);
-
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendings.delete(requestId);
-        reject(
-          new TimeoutError(
-            `No response received for ${msg.action} #${requestId} within ${this.timeout}ms`,
-            this.timeout,
-            {
-              transportType: this.type,
-              transportName: this.name,
-              action: msg.action,
-              requestId,
-            }
-          )
-        );
-      }, this.timeout);
-
-      this.pendings.set(requestId, { resolve, reject, timer });
-      this.socket!.emit('message', message);
-    });
+    return this.isConnectedSync();
   }
 
-  private connectWebSocket(): void {
-    // Prepare socket.io options
-    const socketOptions: any = {
-      path: this.path,
-      autoConnect: true,
-      reconnection: true,
-      reconnectionAttempts: Infinity,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
-      transports: this.socketTransports,
+  onBatch(handler: BatchHandler): void {
+    this.batchHandler = handler || (async () => {});
+  }
+
+  async ackOutbox(payload: OutboxStreamAckPayload): Promise<void> {
+    // WS ACK has no correlationId; server checks business-socket binding
+    await this.send({ action: Actions.OutboxStreamAck, payload });
+  }
+
+  async query<TReq = unknown, TRes = unknown>(route: string, data?: TReq): Promise<TRes> {
+    const correlationId = uuid();
+    const env: Envelope<RpcRequestPayload> = {
+      action: Actions.RpcRequest,
+      correlationId,
+      payload: { route, data },
+      timestamp: Date.now(),
     };
 
-    // Add SSL options if specified
-    if (this.sslOptions) {
-      socketOptions.rejectUnauthorized = this.sslOptions.rejectUnauthorized ?? true;
+    // TODO(perf): whole-envelope stringify will re-escape nested JSON (if data is JSON-string).
+    const serialized = JSON.stringify(env);
+    const size = utf8Len(serialized) + TRANSPORT_OVERHEAD_WIRE;
+    if (size > this.maxBytes) throw new Error(`[ws] message too large: ${size} > ${this.maxBytes}`);
 
-      // Add certificate options if provided
-      if (this.sslOptions.ca || this.sslOptions.cert || this.sslOptions.key) {
-        socketOptions.ca = this.sslOptions.ca;
-        socketOptions.cert = this.sslOptions.cert;
-        socketOptions.key = this.sslOptions.key;
-      }
-    }
+    const socket = this.socket;
+    if (!socket) throw new Error('[ws] socket not initialized');
+    if (!this.isConnectedSync()) throw new Error('[ws] not connected');
 
-    this.socket = io(this.url, socketOptions);
-
-    this.socket.on('connect', () => {
-      console.log(`[${this.name}] WebSocket connected to server`);
+    return await new Promise<TRes>((resolve, reject) => {
+      const onResp = (raw: any) => {
+        let msg: Envelope<RpcResponsePayload>;
+        try {
+          msg = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        } catch {
+          return;
+        }
+        if (msg.action === Actions.RpcResponse && msg.correlationId === correlationId) {
+          socket!.off('message', onResp);
+          if (msg.payload?.err) reject(new Error(String(msg.payload.err)));
+          else resolve(msg.payload?.data as TRes);
+        }
+      };
+      socket.on('message', onResp);
+      socket.emit('message', serialized);
+      // safety timeout on client side
+      setTimeout(() => {
+        socket.off('message', onResp);
+        reject(new Error('[ws] RPC timeout'));
+      }, this.connTimeout);
     });
-
-    this.socket.on('connect_error', (error) => {
-      console.log(`[${this.name}] Error details: ${error.message}`);
-      console.log(`[${this.name}] Trying to connect to: ${this.url}${this.path}`);
-    });
-
-    this.socket.on('disconnect', (reason) => {
-      console.log(`[${this.name}] WebSocket disconnected: ${reason}`);
-      this.businessConnected = false;
-    });
-
-    this.socket.on('reconnect', (attemptNumber) => {
-      console.log(`[${this.name}] WebSocket reconnected after ${attemptNumber} attempts to ${this.url}${this.path}`);
-    });
-
-    this.socket.on('reconnect_attempt', (attemptNumber) => {
-      console.log(`[${this.name}] WebSocket reconnection attempt #${attemptNumber} to ${this.url}${this.path}`);
-    });
-
-    this.socket.on('reconnect_error', (error) => {
-      console.log(`[${this.name}] WebSocket reconnection error:`, error);
-    });
-
-    this.socket.on('message', this.onMessage.bind(this));
   }
 
-  private onMessage = (raw: any): void => {
-    if (!raw || typeof raw !== 'object') return;
-    const { requestId, action, payload } = raw as any;
+  // ==== internals ====
 
-    if (typeof action !== 'string') return;
+  private installHandlers(s: Socket) {
+    s.on('connect', () => {
+      /* fine */
+    });
+    s.on('disconnect', () => {
+      /* socket.io manages reconnects */
+    });
 
-    // Handle responses to pending requests
-    if (requestId && this.pendings.has(requestId)) {
-      const { resolve, reject, timer } = this.pendings.get(requestId)!;
-      clearTimeout(timer);
-      this.pendings.delete(requestId);
-
-      if (action === 'error') {
-        return reject(
-          new MessageError('Server returned error', {
-            transportType: this.type,
-            transportName: this.name,
-            context: { requestId, payload },
-          })
-        );
+    s.on('message', async (raw: any) => {
+      let msg: Envelope<any>;
+      try {
+        msg = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      } catch {
+        return;
       }
 
-      if (action === 'queryResponse') {
-        return resolve(payload);
+      switch (msg.action) {
+        case Actions.Ping: {
+          this.lastPong = Date.now(); // we treat ping as a sign of life as well
+          const pong: Envelope = { action: Actions.Pong, payload: { ts: Date.now() }, timestamp: Date.now() };
+          s.emit('message', JSON.stringify(pong));
+          return;
+        }
+        case Actions.Pong: {
+          this.lastPong = Date.now();
+          return;
+        }
+        case Actions.OutboxStreamBatch: {
+          // WS batches do NOT carry correlationId; ACK will be plain
+          const p = (msg.payload || {}) as OutboxStreamBatchPayload;
+          const events: WireEventRecord[] = Array.isArray(p.events) ? p.events : [];
+          const ctx: BatchContext = {};
+          await this.batchHandler(events, ctx);
+          return;
+        }
+        default:
+          return;
       }
-    }
+    });
+  }
 
-    // Handle ping/pong - business connection
-    if (action === 'ping') {
-      this.lastPongTime = Date.now();
-      this.businessConnected = true;
-      this.socket!.emit('message', { action: 'pong', requestId });
-      return;
-    }
+  private startHeartbeatLoop() {
+    if (this.heartbeatCtl) return;
+    // Client-side: keep a light loop that sends ping if we think we're online
+    this.heartbeatCtl = exponentialIntervalAsync(
+      async (reset) => {
+        // If server pings us, we just need to keep 'lastPong' fresh. Still, send a ping sometimes.
+        const s = this.socket;
+        if (!s || !s.connected) return;
+        const ping: Envelope = { action: Actions.Ping, payload: { ts: Date.now() }, timestamp: Date.now() };
+        s.emit('message', JSON.stringify(ping));
+        // If we recently saw a pong, reset backoff
+        if (this.isConnectedSync()) reset();
+      },
+      { interval: Math.max(500, Math.floor(this.hbTimeout / 2)), multiplier: 2, maxInterval: this.hbTimeout }
+    );
+  }
 
-    // Handle events
-    if (action === 'event' || action === 'eventsBatch') {
-      this.handleMessage({ action, payload, requestId }).catch(() => {
-        // Silently handle errors in client
-      });
-      return;
-    }
-  };
+  private async sendRegister(): Promise<void> {
+    const s = this.socket;
+    if (!s) return;
+    const payload: RegisterStreamConsumerPayload = { token: this.token };
+    const msg: Envelope<RegisterStreamConsumerPayload> = {
+      action: Actions.RegisterStreamConsumer,
+      payload,
+      timestamp: Date.now(),
+    };
+    s.emit('message', JSON.stringify(msg));
+  }
+
+  private async send<T = unknown>(env: Envelope<T>) {
+    const s = this.socket;
+    if (!s) throw new Error('[ws] socket not initialized');
+    // TODO(perf): see top-level note about re-escaping of large nested JSON
+    const serialized = JSON.stringify(env);
+    const size = utf8Len(serialized) + TRANSPORT_OVERHEAD_WIRE;
+    if (size > this.maxBytes) throw new Error(`[ws] message too large: ${size} > ${this.maxBytes}`);
+    s.emit('message', serialized);
+  }
 }

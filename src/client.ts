@@ -1,131 +1,52 @@
-import type { ClientTransportOptions } from './core/factory';
-import { TransportFactory } from './core/factory';
-import { MessageError } from './shared';
-import type { ITransport, BasePayload, IncomingMessage } from './shared';
+// High-level client facade that wraps a Transport.
+// Responsibilities:
+// - lifecycle: connect/disconnect/awaitConnected
+// - streaming: set handler, provide ack helper
+// - rpc: query(route,data)
 
-export interface ClientOptions {
-  transport: ClientTransportOptions;
-}
+import type { Transport, WireEventRecord, OutboxStreamAckPayload, BatchContext } from './shared';
+import { BatchHandler } from './shared';
 
-export interface QueryResult<T = any> {
-  requestId: string;
-  payload: T;
-  timestamp: number;
-  responseTimestamp: number;
-}
+export class TransportClient {
+  constructor(private readonly transport: Transport) {}
 
-export class Client {
-  private _transport: ITransport;
-
-  constructor(options: ClientOptions) {
-    this._transport = TransportFactory.create(options.transport);
-
-    // Setup graceful shutdown
-    const shutdown = () =>
-      this._transport.destroy().catch(() => {
-        // Silently handle shutdown errors
-      });
-    process.once('SIGINT', shutdown);
-    process.once('SIGTERM', shutdown);
+  kind() {
+    return this.transport.kind();
   }
 
-  get transport(): ITransport {
-    return this._transport;
+  async connect() {
+    await this.transport.connect();
+  }
+  async disconnect() {
+    await this.transport.disconnect();
   }
 
-  /**
-   * Execute a query and wait for response
-   */
-  public async query<T = any>(requestId: string, payload: BasePayload): Promise<QueryResult<T>> {
-    if (!requestId) {
-      throw new MessageError('requestId is required', {
-        transportType: this.transport.type,
-        context: { payload },
-      });
-    }
-
-    const timestamp = Date.now();
-    const message: IncomingMessage = {
-      action: 'query',
-      requestId,
-      payload,
-      timestamp,
-    };
-
-    const responsePayload = await this.transport.sendAndAwait<T>(message);
-
-    return {
-      requestId,
-      payload: responsePayload,
-      timestamp,
-      responseTimestamp: Date.now(),
-    };
+  isConnectedSync() {
+    return this.transport.isConnectedSync();
+  }
+  awaitConnected(timeoutMs?: number) {
+    return this.transport.awaitConnected(timeoutMs);
   }
 
-  /**
-   * Execute a streaming query (for transports that support it)
-   */
-  public async *streamQuery<T = any>(requestId: string, payload: BasePayload): AsyncGenerator<T, void, unknown> {
-    if (!requestId) {
-      throw new MessageError('requestId is required', {
-        transportType: this.transport.type,
-        transportName: this.transport.name,
-        context: { payload },
-      });
-    }
-
-    const message: IncomingMessage = {
-      action: 'streamQuery',
-      requestId,
-      payload,
-      timestamp: Date.now(),
-    };
-
-    // For streaming, we need to handle multiple responses
-    const result = await this.transport.sendAndAwait<T[] | T>(message);
-
-    // Convert array to async generator
-    if (Array.isArray(result)) {
-      for (const item of result) {
-        yield item;
-      }
-    } else {
-      yield result;
-    }
+  onBatch(
+    handler: (
+      events: WireEventRecord[],
+      ctx: BatchContext,
+      ack: (payload: OutboxStreamAckPayload) => Promise<void>
+    ) => Promise<void> | void
+  ) {
+    // Wrap the provided handler to give an ack helper bound to ctx
+    this.transport.onBatch(async (events: any, ctx: any) => {
+      const ack = (p: OutboxStreamAckPayload) => this.transport.ackOutbox(p, ctx);
+      await handler(events, ctx, ack);
+    });
   }
 
-  /**
-   * Subscribe to events by constructor name
-   */
-  public subscribe<T = any>(constructorName: string, cb: (event: T) => Promise<void>): () => void {
-    return this.transport.subscribe(constructorName, cb);
+  ackOutbox(p: OutboxStreamAckPayload, ctx?: BatchContext) {
+    return this.transport.ackOutbox(p, ctx);
   }
 
-  /**
-   * Check if transport is connected
-   */
-  public isConnected(): boolean {
-    return this.transport.isConnected();
-  }
-
-  /**
-   * Get number of active subscriptions for a specific event type
-   */
-  public getSubscriptionCount(constructorName: string): number {
-    return this.transport.getSubscriptionCount(constructorName);
-  }
-
-  /**
-   * Get all active subscription names
-   */
-  public getActiveSubscriptions(): string[] {
-    return this.transport.getActiveSubscriptions();
-  }
-
-  /**
-   * Destroy the client and cleanup resources
-   */
-  public async destroy(): Promise<void> {
-    await this.transport.destroy();
+  query<TReq = unknown, TRes = unknown>(route: string, data?: TReq): Promise<TRes> {
+    return this.transport.query<TReq, TRes>(route, data);
   }
 }

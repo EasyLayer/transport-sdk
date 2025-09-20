@@ -1,195 +1,104 @@
-import type { AxiosInstance } from 'axios';
-import axios from 'axios';
-import https from 'https';
-import type { BaseTransportOptions } from '../core/transport';
-import { BaseTransport } from '../core/transport';
-import { ConnectionError, MessageError, MESSAGE_SIZE_LIMITS } from '../shared';
-import type { IncomingMessage } from '../shared';
-import { validateMessageSize } from '../shared';
+// Plain HTTP transport: synchronous RPC via POST /rpc (or a given endpoint).
+//
+// Note: This client does not receive streaming batches over HTTP (no push).
+// For outbox consumption use WS or IPC transports.
 
-export interface HttpClientOptions extends BaseTransportOptions {
-  type: 'http';
-  baseUrl: string;
+import type {
+  Transport,
+  TransportOptions,
+  Envelope,
+  RpcRequestPayload,
+  BatchHandler,
+  OutboxStreamAckPayload,
+} from '../shared';
+import { Actions, RpcResponsePayload, TRANSPORT_OVERHEAD_WIRE, utf8Len, uuid } from '../shared';
+
+export interface HttpClientOptions extends TransportOptions {
+  baseUrl: string; // e.g., "https://host:3000"
+  rpcPath?: string; // e.g., "/rpc"
   headers?: Record<string, string>;
-  maxMessageSize?: number;
-  ssl?: {
-    enabled?: boolean;
-    rejectUnauthorized?: boolean;
-    ca?: string;
-    cert?: string;
-    key?: string;
-  };
 }
 
-export class HttpTransport extends BaseTransport {
-  private readonly axiosInstance: AxiosInstance;
-  private readonly maxMessageSize: number;
-  private readonly sslOptions: HttpClientOptions['ssl'];
+export class HttpClientTransport implements Transport {
+  private readonly base: string;
+  private readonly path: string;
+  private readonly headers: Record<string, string>;
+  private readonly maxBytes: number;
+  private readonly connTimeout: number;
+  private readonly token?: string;
 
-  constructor(options: HttpClientOptions) {
-    super('http', options.name ?? 'http', options);
+  private batchHandler: BatchHandler = async () => {};
 
-    this.maxMessageSize = options.maxMessageSize ?? MESSAGE_SIZE_LIMITS.HTTP;
-    this.sslOptions = options.ssl;
+  constructor(private readonly opts: HttpClientOptions) {
+    this.base = opts.baseUrl.replace(/\/+$/, '');
+    this.path = opts.rpcPath ?? '/rpc';
+    this.headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+    this.maxBytes = opts.maxMessageBytes ?? 1024 * 1024;
+    this.connTimeout = opts.connectionTimeout ?? 5000;
+    this.token = opts.token;
+    if (this.token) this.headers['X-Transport-Token'] = this.token;
+  }
 
-    // Auto-detect SSL from URL if not explicitly set
-    const isSSL = this.sslOptions?.enabled ?? options.baseUrl.startsWith('https://');
+  kind(): 'http' {
+    return 'http';
+  }
 
-    // Prepare axios config
-    const axiosConfig: any = {
-      baseURL: options.baseUrl.replace(/\/$/, ''),
-      headers: options.headers,
-      timeout: this.timeout,
+  async connect(): Promise<void> {
+    /* stateless */
+  }
+  async disconnect(): Promise<void> {
+    /* stateless */
+  }
+
+  isConnectedSync(): boolean {
+    return true;
+  }
+  async awaitConnected(): Promise<boolean> {
+    return true;
+  }
+
+  onBatch(handler: BatchHandler): void {
+    // HTTP has no streaming: keep handler but never invoked.
+    this.batchHandler = handler || (async () => {});
+  }
+
+  async ackOutbox(_payload: OutboxStreamAckPayload): Promise<void> {
+    // no-op (no streaming over HTTP)
+  }
+
+  async query<TReq = unknown, TRes = unknown>(route: string, data?: TReq): Promise<TRes> {
+    const correlationId = uuid();
+    const env: Envelope<RpcRequestPayload> = {
+      action: Actions.RpcRequest,
+      correlationId,
+      payload: { route, data },
+      timestamp: Date.now(),
     };
 
-    // Add SSL configuration if using HTTPS
-    if (isSSL && this.sslOptions) {
-      const httpsAgentOptions: any = {
-        rejectUnauthorized: this.sslOptions.rejectUnauthorized ?? true,
-      };
+    // TODO(perf): whole-envelope stringify re-escapes nested JSON values
+    const serialized = JSON.stringify(env);
+    const size = utf8Len(serialized) + TRANSPORT_OVERHEAD_WIRE;
+    if (size > this.maxBytes) throw new Error(`[http] message too large: ${size} > ${this.maxBytes}`);
 
-      // Add certificate options if provided
-      if (this.sslOptions.ca) {
-        httpsAgentOptions.ca = this.sslOptions.ca;
-      }
-      if (this.sslOptions.cert) {
-        httpsAgentOptions.cert = this.sslOptions.cert;
-      }
-      if (this.sslOptions.key) {
-        httpsAgentOptions.key = this.sslOptions.key;
-      }
-
-      axiosConfig.httpsAgent = new https.Agent(httpsAgentOptions);
-    }
-
-    this.axiosInstance = axios.create(axiosConfig);
-
-    console.log(`[${this.name}] HTTP transport configured for ${options.baseUrl} ${isSSL ? '(SSL)' : '(no SSL)'}`);
-  }
-
-  isConnected(): boolean {
-    return true; // HTTP always "connected"
-  }
-
-  protected async forward(message: IncomingMessage): Promise<void> {
-    validateMessageSize(message, this.maxMessageSize, this.type, this.name);
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), this.connTimeout);
 
     try {
-      await this.axiosInstance.post('', message);
-    } catch (err: any) {
-      throw new ConnectionError('HTTP forward failed', {
-        transportType: this.type,
-        transportName: this.name,
-        cause: err,
-        context: {
-          status: err.response?.status,
-          statusText: err.response?.statusText,
-          action: message.action,
-          ssl: this.sslOptions?.enabled || false,
-        },
+      const res = await fetch(this.base + this.path, {
+        method: 'POST',
+        headers: this.headers,
+        body: serialized,
+        signal: ctrl.signal,
       });
-    }
-  }
-
-  protected async transmit(message: IncomingMessage): Promise<any> {
-    validateMessageSize(message, this.maxMessageSize, this.type, this.name);
-
-    try {
-      // For streaming queries, use different endpoint
-      if (message.action === 'streamQuery') {
-        return await this.handleStreamingRequest(message);
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(`[http] status ${res.status}`);
+      if (json?.action !== Actions.RpcResponse || json?.correlationId !== correlationId) {
+        throw new Error('[http] invalid RPC response');
       }
-
-      const response = await this.axiosInstance.post('', message);
-
-      if (!response.data) {
-        throw new MessageError('Server returned empty response', {
-          transportType: this.type,
-          transportName: this.name,
-          context: {
-            status: response.status,
-            action: message.action,
-            ssl: this.sslOptions?.enabled || false,
-          },
-        });
-      }
-
-      return response.data.payload || response.data;
-    } catch (err: any) {
-      if (err instanceof MessageError) {
-        throw err;
-      }
-
-      throw new ConnectionError('HTTP transmit failed', {
-        transportType: this.type,
-        transportName: this.name,
-        cause: err,
-        context: {
-          status: err.response?.status,
-          statusText: err.response?.statusText,
-          action: message.action,
-          ssl: this.sslOptions?.enabled || false,
-        },
-      });
+      if (json?.payload?.err) throw new Error(String(json.payload.err));
+      return json?.payload?.data as TRes;
+    } finally {
+      clearTimeout(to);
     }
-  }
-
-  private async handleStreamingRequest(message: IncomingMessage): Promise<any[]> {
-    try {
-      const response = await this.axiosInstance.post('/stream', message, {
-        responseType: 'stream',
-      });
-
-      const results: any[] = [];
-      let buffer = '';
-
-      return new Promise((resolve, reject) => {
-        response.data.on('data', (chunk: Buffer) => {
-          buffer += chunk.toString();
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || ''; // Keep incomplete line
-
-          for (const line of lines) {
-            if (line.trim()) {
-              try {
-                const parsed = JSON.parse(line);
-                if (parsed.action === 'streamResponse') {
-                  results.push(parsed.payload);
-                } else if (parsed.action === 'streamEnd') {
-                  resolve(results);
-                  return;
-                } else if (parsed.action === 'error') {
-                  reject(new Error(parsed.payload.error));
-                  return;
-                }
-              } catch (parseErr) {
-                // Ignore parse errors in streaming
-              }
-            }
-          }
-        });
-
-        response.data.on('end', () => {
-          resolve(results);
-        });
-
-        response.data.on('error', (err: any) => {
-          reject(err);
-        });
-      });
-    } catch (err: any) {
-      throw new ConnectionError('HTTP stream request failed', {
-        transportType: this.type,
-        transportName: this.name,
-        cause: err,
-        context: {
-          ssl: this.sslOptions?.enabled || false,
-        },
-      });
-    }
-  }
-
-  async destroy(): Promise<void> {
-    // No-op for HTTP-based transport
   }
 }
