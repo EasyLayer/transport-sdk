@@ -1,48 +1,43 @@
-import type { ChildProcess } from 'node:child_process';
 import type { Message, OutboxStreamAckPayload, OutboxStreamBatchPayload, QueryRequestPayload } from '../core';
 import { Actions, createDomainEventFromWire } from '../core';
 import { normalize, delay, uuid, nextBackoff } from '../core';
-
 /**
- * IpcParentClient
+ * IpcChildClient
  * -----------------------------------------------------------------------------
  * Role:
- * - Runs in the parent process and communicates with a given ChildProcess.
- * - Mirrors the server's IpcParentTransportService protocol:
+ * - Runs inside a child process (spawned with IPC channel).
+ * - Communicates with the parent via `process.send` / `process.on('message', ...)`.
+ * - Mirrors the server's IpcChildTransportService protocol:
  *   * Ping/Pong with optional password.
  *   * Outbox batch -> fan-out -> send Ack.
  *   * Query request/response.
  *
  * Ownership:
- * - Does not spawn the child; the host app provides `child`.
- * - Cleans up event listeners on `close()`.
+ * - Does not manage process lifecycle; only wires message handlers.
+ * - Cleans up listeners on `close()`.
  */
-export class IpcParentClient {
+export class IpcChildClient {
   private subs = new Map<string, Set<(evt: any) => unknown | Promise<unknown>>>();
   private pendingQueries = new Map<string, (payload: any) => void>();
 
-  private readonly child: ChildProcess;
   private readonly pongPassword?: string;
-
   private onMessageBound = (raw: unknown) => this.onRaw(raw);
 
-  constructor(opts: { child: ChildProcess; pongPassword?: string }) {
-    if (!opts?.child) throw new Error('[client-ipc-parent] child is required');
-    this.child = opts.child;
+  constructor(opts: { pongPassword?: string } = {}) {
     this.pongPassword = opts.pongPassword;
-
-    this.child.on('message', this.onMessageBound);
+    (process as any).on?.('message', this.onMessageBound);
   }
 
   // ---------------------------------------------------------------------------
   // Usage examples:
   // ---------------------------------------------------------------------------
-  // const cp = fork('child.js', { stdio: ['inherit', 'inherit', 'inherit', 'ipc'] });
-  // const c = new IpcParentClient({ child: cp, pongPassword: 'pw' });
+  // // In child.js:
+  // const c = new IpcChildClient({ pongPassword: 'pw' });
   // c.subscribe('UserCreated', (e) => { ... });
   // const res = await c.query('GetUser', { id: 1 });
+  //
+  // // Parent spawns child with stdio: ['inherit','inherit','inherit','ipc']
 
-  // ---- subscriptions ----
   subscribe<T = any>(constructorName: string, handler: (evt: T) => unknown | Promise<unknown>): () => void {
     const set = this.subs.get(constructorName) ?? new Set();
     set.add(handler as any);
@@ -53,7 +48,6 @@ export class IpcParentClient {
     return this.subs.get(constructorName)?.size ?? 0;
   }
 
-  // ---- query ----
   async query<TReq, TRes>(name: string, dto?: TReq, timeoutMs = 5_000): Promise<TRes> {
     const requestId = uuid();
     const env: Message<QueryRequestPayload> = {
@@ -67,7 +61,7 @@ export class IpcParentClient {
     const p = new Promise<TRes>((resolve) => (resolveFn = resolve));
     this.pendingQueries.set(requestId, resolveFn);
 
-    this.child.send?.(env as any);
+    (process as any).send?.(env);
 
     const deadline = Date.now() + timeoutMs;
     const backoff = { wait: 16 };
@@ -78,11 +72,11 @@ export class IpcParentClient {
     }
 
     this.pendingQueries.delete(requestId);
-    throw new Error('[client-ipc-parent] query timeout');
+    throw new Error('[client-ipc-child] query timeout');
   }
 
   async close(): Promise<void> {
-    this.child.off('message', this.onMessageBound);
+    (process as any).off?.('message', this.onMessageBound);
     this.pendingQueries.clear();
     this.subs.clear();
   }
@@ -99,7 +93,7 @@ export class IpcParentClient {
           payload: this.pongPassword ? { password: this.pongPassword } : undefined,
           timestamp: Date.now(),
         };
-        this.child.send?.(pong as any);
+        (process as any).send?.(pong);
         return;
       }
 
@@ -119,7 +113,7 @@ export class IpcParentClient {
           timestamp: Date.now(),
           payload: { ok: true, okIndices: p.events.map((_e, i) => i) },
         };
-        this.child.send?.(ack as any);
+        (process as any).send?.(ack);
         return;
       }
 

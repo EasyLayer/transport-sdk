@@ -1,145 +1,292 @@
-// Unified HTTP transport (no internal server).
-// 1) RPC query via POST baseUrl + rpcPath.
-// 2) Webhook forward: injectEnvelope(env) -> forward to forwardWebhook.url (expects ACK in HTTP response),
-//    then optionally dispatch locally.
-//
-// Time: O(1) per message; Space: O(1).
-
+import { URL } from 'node:url';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import express from 'express';
 import type {
-  Transport,
-  TransportCapabilities,
-  Envelope,
-  BatchContext,
-  OutboxStreamBatchPayload,
+  Message,
   OutboxStreamAckPayload,
+  OutboxStreamBatchPayload,
   QueryRequestPayload,
-} from '../core/transport';
-import { Actions, isAction, TRANSPORT_OVERHEAD_WIRE, utf8Len } from '../core/transport';
+  QueryResponsePayload,
+} from '../core';
+import { Actions, createDomainEventFromWire, utf8Len, TRANSPORT_OVERHEAD_WIRE } from '../core';
 
-export interface HttpRpcOptions {
-  baseUrl?: string;
-  rpcPath?: string;
+export type HttpInboundOptions = {
+  /** Full URL where the server will POST batches (defines exact path to mount). */
+  webhookUrl: string;
+  /** Optional separate URL for ping. If omitted, ping is served on webhook path as well. */
+  pingUrl?: string;
+  /** Optional token to validate inbound webhook/ping via "x-transport-token". */
+  token?: string;
+  /** If set, include { password } in Pong payload so the server accepts it. */
+  pongPassword?: string;
+  /** Maximum allowed wire size in bytes. Default: 1 MiB. */
+  maxWireBytes?: number;
+};
 
-  ackPath?: string; // rarely used when not forwarding
+export type HttpQueryOptions = {
+  /** Application base URL for queries; will POST to `${baseUrl}/query`. */
+  baseUrl: string;
+};
 
-  forwardWebhook?: {
-    url: string;
-    headers?: Record<string, string>;
-    dispatchLocallyAfterAck?: boolean; // default true
-  };
+export type SubscribeHandler<T = any> = (evt: T) => unknown | Promise<unknown>;
 
-  fetchImpl?: typeof fetch;
-  maxMessageBytes?: number;
-  connectionTimeout?: number; // noop here
-}
-
-export class HttpRpcClient implements Transport {
-  private connected = false;
-  private rawBatchHandler: ((b: OutboxStreamBatchPayload, ctx: BatchContext) => Promise<void>) | null = null;
-  private rawEnvelopeHandler?: (e: Envelope, ctx: BatchContext) => void;
+/**
+ * HttpClient
+ * -----------------------------------------------------------------------------
+ * Role:
+ * - Does not start its own server. Instead, provides:
+ *   * `nodeHttpHandler` — a Node http/https request listener.
+ *   * `expressRouter()` — an Express Router with exact paths from options.
+ * - Responds to pings with Pong (optionally including password).
+ * - Accepts Outbox batches, fans them out to subscribers by `eventType`,
+ *   then replies synchronously with ACK (`{ ok: true, okIndices }`).
+ * - Sends queries to `${baseUrl}/query` as `{ name, data }` and expects
+ *   `{ ok, data?, err? }` like your HttpTransportService.
+ *
+ * Notes:
+ * - Token check (if configured): `x-transport-token`.
+ * - ACK is synchronous in HTTP (returned as the response body).
+ * - No timers/sockets are owned, so `close()` is a no-op.
+ */
+export class HttpClient {
+  private readonly webhook: URL;
+  private readonly pingPath?: string;
+  private readonly token?: string;
+  private readonly pongPassword?: string;
   private readonly maxBytes: number;
-  private readonly fetcher: typeof fetch;
 
-  constructor(private readonly opts: HttpRpcOptions) {
-    this.maxBytes = opts.maxMessageBytes ?? 1024 * 1024;
-    this.fetcher = opts.fetchImpl ?? (globalThis as any).fetch;
-    if (!this.fetcher) throw new Error('[http] fetch is not available; pass fetchImpl or polyfill globally');
-  }
+  private readonly queryBase: string;
 
-  kind() {
-    return 'http' as const;
-  }
+  private subs = new Map<string, Set<SubscribeHandler>>();
 
-  capabilities(): TransportCapabilities {
-    return { canQuery: Boolean(this.opts.baseUrl && this.opts.rpcPath) };
-  }
+  constructor(inbound: HttpInboundOptions, query: HttpQueryOptions) {
+    if (!query?.baseUrl) throw new Error('[client-http] query.baseUrl is required');
+    if (!inbound?.webhookUrl) throw new Error('[client-http] inbound.webhookUrl is required');
 
-  async connect(): Promise<void> {
-    this.connected = true;
-  }
-  async disconnect(): Promise<void> {
-    this.connected = false;
-  }
-  isConnectedSync(): boolean {
-    return this.connected;
-  }
-  async awaitConnected(): Promise<boolean> {
-    return this.connected;
-  }
-  onRawBatch(h: (b: OutboxStreamBatchPayload, ctx: BatchContext) => Promise<void>) {
-    this.rawBatchHandler = h;
-  }
-  onRawEnvelope(h: (e: Envelope, ctx: BatchContext) => void) {
-    this.rawEnvelopeHandler = h;
-  }
+    this.webhook = new URL(inbound.webhookUrl);
+    this.token = inbound.token;
+    this.pongPassword = inbound.pongPassword;
+    this.maxBytes = inbound.maxWireBytes ?? 1024 * 1024;
 
-  async ackOutbox(_p: OutboxStreamAckPayload): Promise<void> {
-    // not used in HTTP client (ACK is returned by server in forward mode)
-    return;
-  }
+    // pingPath: either provided via pingUrl or default to '/ping'
+    this.pingPath = (inbound.pingUrl ? new URL(inbound.pingUrl).pathname : '/ping').replace(/\/+$/, '') || '/ping';
 
-  /** Forward/inject path for tests/bridges. */
-  async injectEnvelope(env: Envelope, ctx?: BatchContext) {
-    if (isAction(env.action as string, 'OutboxStreamBatch')) {
-      // forward first (if configured)
-      if (this.opts.forwardWebhook?.url) {
-        const json = JSON.stringify(env);
-        if (utf8Len(json) + TRANSPORT_OVERHEAD_WIRE > this.maxBytes)
-          throw new Error('[http] forwarded batch too large');
-        const res = await this.fetcher(this.opts.forwardWebhook.url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...(this.opts.forwardWebhook.headers ?? {}) },
-          body: json,
-        });
-        if (!res.ok) throw new Error(`[http] forward webhook ${res.status}`);
-        const ack = await res.json().catch(() => ({}));
-        const ok = isAction(ack?.action, 'OutboxStreamAck');
-        if (!ok) throw new Error('[http] forward webhook did not return OutboxStreamAck');
-      }
-      // then dispatch locally (default)
-      if (this.rawBatchHandler && this.opts.forwardWebhook?.dispatchLocallyAfterAck !== false) {
-        const style = (env.action as string).includes('outboxStreamBatch') ? 'camel' : 'dot';
-        await this.rawBatchHandler(
-          { ...(env.payload as OutboxStreamBatchPayload), _actionName: env.action as string },
-          { ...(ctx ?? { transport: 'http' }), actionStyle: style }
-        );
-      }
-      return;
-    }
+    this.queryBase = query.baseUrl.replace(/\/+$/, '');
 
-    if (isAction(env.action as string, 'QueryResponse') && this.rawEnvelopeHandler) {
-      this.rawEnvelopeHandler(env, ctx ?? { transport: 'http' });
-      return;
+    // prevent accidental overlap with webhook path
+    const hookPath = (this.webhook.pathname || '/events').replace(/\/+$/, '') || '/events';
+    if (this.pingPath === hookPath) {
+      throw new Error('[client-http] pingPath must differ from webhook path');
     }
   }
 
-  /** RPC over HTTP: POST request/inline response. */
-  async query<TReq, TRes>(requestId: string, body: QueryRequestPayload<TReq>): Promise<TRes> {
-    if (!this.opts.baseUrl || !this.opts.rpcPath)
-      throw new Error('[http] query not configured (baseUrl/rpcPath missing)');
-    const env: Envelope<QueryRequestPayload<TReq>> = {
-      action: Actions.QueryRequest,
-      requestId,
-      timestamp: Date.now(),
-      payload: body,
-    };
-    const json = JSON.stringify(env);
-    if (utf8Len(json) + TRANSPORT_OVERHEAD_WIRE > this.maxBytes) throw new Error('[http] message too large');
+  // ---- subscriptions ----
+  subscribe<T = any>(constructorName: string, handler: SubscribeHandler<T>): () => void {
+    const set = this.subs.get(constructorName) ?? new Set();
+    set.add(handler as any);
+    this.subs.set(constructorName, set);
+    return () => set.delete(handler as any);
+  }
+  getSubscriptionCount(constructorName: string): number {
+    return this.subs.get(constructorName)?.size ?? 0;
+  }
+  private async dispatchBatch(batch: OutboxStreamBatchPayload) {
+    const events = batch.events ?? [];
+    for (const wire of events) {
+      const name = wire.eventType;
+      const set = this.subs.get(name);
+      if (!set?.size) continue;
+      const evt = createDomainEventFromWire(wire);
+      for (const h of set) await h(evt);
+    }
+  }
 
-    const res = await this.fetcher(this.opts.baseUrl + this.opts.rpcPath, {
+  // ---- query out ----
+  async query<TRes = any>(req: QueryRequestPayload): Promise<TRes> {
+    const body = JSON.stringify({ name: req.name, dto: req.dto });
+    if (utf8Len(body) + TRANSPORT_OVERHEAD_WIRE > this.maxBytes) {
+      throw new Error('[client-http] query payload too large');
+    }
+
+    const res = await fetch(this.queryBase + '/query', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: json,
+      body,
     });
-    if (!res.ok) throw new Error(`[http] ${res.status}`);
 
-    const respEnv = (await res.json()) as Envelope;
-    if (isAction(respEnv.action as string, 'QueryResponse') && respEnv.requestId === requestId) {
-      const p = respEnv.payload as any;
-      if (p?.ok === false) throw new Error(String(p?.err ?? 'query failed'));
-      return (p?.data ?? p?.payload) as TRes;
+    if (!res.ok) {
+      const text = await safeReadText(res);
+      throw new Error(`[client-http] ${res.status} ${text || ''}`.trim());
     }
-    this.rawEnvelopeHandler?.(respEnv, { transport: 'http' });
-    return undefined as unknown as TRes;
+
+    const p = (await res.json()) as QueryResponsePayload;
+    if (!p || typeof p.ok !== 'boolean') throw new Error('[client-http] invalid query response');
+    if (p.ok === false) throw new Error(String(p.err ?? 'query failed'));
+    return p.data as TRes;
   }
+
+  // --- Node HTTP/HTTPS request handler ----------------------------------------
+  // Passive inbox with two POST routes only:
+  //   • POST {hookPath} – strictly accepts OutboxStreamBatch and replies with ACK.
+  //   • POST {pingPath} – always returns Pong (optionally with { password }).
+  //
+  // Notes:
+  // - No GET handlers; any non-POST or unknown path → 404.
+  // - Token guard (x-transport-token) applies to both routes when configured.
+  // - 400 for invalid JSON/payload; 422 for well-formed envelope with wrong action.
+  nodeHttpHandler = async (req: IncomingMessage, res: ServerResponse) => {
+    try {
+      // Optional shared-secret guard
+      if (this.token) {
+        const got = String(req.headers['x-transport-token'] ?? '');
+        if (got !== this.token) return this.replyText(res, 401, 'unauthorized');
+      }
+
+      // Normalize paths
+      const pathname = (req.url?.split('?')[0] || '/').replace(/\/+$/, '');
+      const hookPath = (this.webhook.pathname || '/').replace(/\/+$/, '') || '/';
+      const pingPath = this.pingPath ?? '/ping';
+
+      // 1) POST {pingPath} → Pong
+      if (req.method === 'POST' && pathname === pingPath) {
+        const pong: Message = {
+          action: Actions.Pong,
+          payload: this.pongPassword ? { password: this.pongPassword } : undefined,
+          timestamp: Date.now(),
+        };
+        return this.replyJson(res, 200, pong);
+      }
+
+      // 2) POST {hookPath} → strictly OutboxStreamBatch
+      if (req.method === 'POST' && pathname === hookPath) {
+        const body = await readBodyBounded(req, this.maxBytes - TRANSPORT_OVERHEAD_WIRE);
+        if (!body.ok) return this.replyText(res, body.errCode!, body.errText!);
+
+        let msg: Message;
+        try {
+          msg = JSON.parse(body.body || '{}');
+        } catch {
+          return this.replyText(res, 400, 'invalid json');
+        }
+
+        if (!msg || typeof msg.action !== 'string') return this.replyText(res, 422, 'invalid message');
+        if (msg.action !== Actions.OutboxStreamBatch) return this.replyText(res, 422, 'invalid action');
+
+        const p = msg.payload as OutboxStreamBatchPayload;
+        if (!p || !Array.isArray(p.events)) return this.replyText(res, 400, 'invalid payload');
+
+        await this.dispatchBatch(p);
+
+        const ack: Message<OutboxStreamAckPayload> = {
+          action: Actions.OutboxStreamAck,
+          timestamp: Date.now(),
+          payload: { ok: true, okIndices: p.events.map((_e, i) => i) },
+        };
+        return this.replyJson(res, 200, ack);
+      }
+
+      // 3) Everything else → 404
+      return this.replyText(res, 404, 'not found');
+    } catch (e: any) {
+      return this.replyText(res, 500, String(e?.message ?? e ?? 'internal error'));
+    }
+  };
+
+  // --- Express Router factory --------------------------------------------------
+  // Exposes the same POST-only inbox:
+  //   • POST {hookPath} – strictly OutboxStreamBatch → ACK
+  //   • POST {pingPath} – always returns Pong
+  //
+  // Notes:
+  // - Token guard attached to both routes if configured.
+  expressRouter() {
+    const r = express.Router();
+
+    const hookPath = (this.webhook.pathname || '/').replace(/\/+$/, '') || '/';
+    const pingPath = this.pingPath ?? '/ping';
+
+    // Token guard for both inbox routes (if configured)
+    if (this.token) {
+      r.use([hookPath, pingPath], (req, res, next) => {
+        const got = String(req.header('x-transport-token') ?? '');
+        if (got !== this.token) return res.status(401).send('unauthorized');
+        next();
+      });
+    }
+
+    // POST {pingPath} → Pong
+    r.post(pingPath, (_req, res) => {
+      const pong: Message<{ password?: string }> = {
+        action: Actions.Pong,
+        payload: this.pongPassword ? { password: this.pongPassword } : undefined,
+        timestamp: Date.now(),
+      };
+      res.status(200).json(pong);
+    });
+
+    // POST {hookPath} → strictly OutboxStreamBatch
+    r.post(hookPath, express.json({ limit: '2mb' }), async (req, res) => {
+      const msg = req.body as Message;
+
+      if (!msg || typeof msg.action !== 'string') return res.status(422).send('invalid message');
+      if (msg.action !== Actions.OutboxStreamBatch) return res.status(422).send('invalid action');
+
+      const p = msg.payload as OutboxStreamBatchPayload;
+      if (!p || !Array.isArray(p.events)) return res.status(400).send('invalid payload');
+
+      await this.dispatchBatch(p);
+
+      const ack: Message<OutboxStreamAckPayload> = {
+        action: Actions.OutboxStreamAck,
+        timestamp: Date.now(),
+        payload: { ok: true, okIndices: p.events.map((_e, i) => i) },
+      };
+      return res.status(200).json(ack);
+    });
+
+    return r;
+  }
+
+  async close(): Promise<void> {
+    // No owned resources to release.
+  }
+
+  // ---- helpers ----
+  private replyJson(res: ServerResponse, code: number, obj: unknown) {
+    const s = JSON.stringify(obj);
+    res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(s) });
+    res.end(s);
+  }
+  private replyText(res: ServerResponse, code: number, text: string) {
+    res.writeHead(code, { 'Content-Type': 'text/plain', 'Content-Length': Buffer.byteLength(text) });
+    res.end(text);
+  }
+}
+
+async function safeReadText(res: Response) {
+  try {
+    return await res.text();
+  } catch {
+    return '';
+  }
+}
+function readBodyBounded(
+  req: IncomingMessage,
+  limit: number
+): Promise<{ ok: true; body: string } | { ok: false; errCode: number; errText: string }> {
+  return new Promise((resolve) => {
+    let size = 0;
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => {
+      size += c.length;
+      if (size > limit) {
+        resolve({ ok: false, errCode: 413, errText: 'payload too large' });
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve({ ok: true, body: Buffer.concat(chunks).toString('utf8') }));
+    req.on('error', () => resolve({ ok: false, errCode: 400, errText: 'bad request' }));
+  });
 }

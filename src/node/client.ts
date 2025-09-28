@@ -1,163 +1,202 @@
-import type {
-  Transport,
-  TransportCapabilities,
-  OutboxStreamBatchPayload,
-  OutboxStreamAckPayload,
-  Envelope,
-  QueryResponsePayload,
-  QueryRequestPayload,
-} from '../core/transport';
-import { isAction, uuid } from '../core/transport';
-import { createDomainEventFromWire } from '../core/domain-event';
-import { WsNodeTransport, type WsNodeOptions } from './ws';
-import { IpcParentTransport, type IpcParentOptions } from './ipc-parent';
-import { HttpRpcClient, type HttpRpcOptions } from './http';
-
-type TransportConfig =
-  | { type: 'ws'; options: WsNodeOptions }
-  | { type: 'ipc-parent'; options: IpcParentOptions }
-  | { type: 'http'; options: HttpRpcOptions };
-
-type SubscribeHandler<T = any> = (evt: T) => unknown | Promise<unknown>;
-
-export interface ClientOptions {
-  transport: Transport | TransportConfig;
-}
+import type { QueryRequestPayload } from '../core';
+import { uuid } from '../core';
+import { HttpClient, type HttpInboundOptions, type HttpQueryOptions } from './http';
+import { WsClient } from './ws';
+import { IpcParentClient } from './ipc-parent';
+import { IpcChildClient } from './ipc-child';
+import { ElectronIpcRendererClient } from './electron-ipc-renderer';
 
 /**
- * Node Client
- * - Supports queries (gated by transport handshake: Ping->Pong).
- * - Registers handlers before connect(); auto-ACK after successful onRawBatch.
- * - Single-channel 'message' is enforced in transports.
+ * Client
+ * -----------------------------------------------------------------------------
+ * Unified facade for five transports:
+ *   - HTTP (handlers-only):        does not start a server; gives you handlers to mount.
+ *   - WS (client socket):          owns or attaches to a WebSocket connection.
+ *   - IPC Parent (holds ChildProcess): communicates with a provided child.
+ *   - IPC Child (runs in child):   communicates with the parent via process IPC.
+ *   - Electron renderer (ipcRenderer): talks to Electron main via 'transport:message'.
+ *
+ * Quick usage:
+ * -----------------------------------------------------------------------------
+ * HTTP:
+ *   const c = new Client({
+ *     transport: {
+ *       type: 'http',
+ *       inbound: { webhookUrl: 'http://0.0.0.0:3001/webhook', pongPassword: 'pw', token: 't' },
+ *       query:   { baseUrl: 'http://server:3000' },
+ *     }
+ *   });
+ *   // mount:
+ *   createServer(c.nodeHttpHandler()).listen(3001);
+ *   // or:
+ *   app.use(c.expressRouter());
+ *   // subscribe + query:
+ *   c.subscribe('UserCreated', (e) => {});
+ *   const res = await c.query('GetUser', { id: 1 });
+ *
+ * WS:
+ *   // managed
+ *   const c = new Client({ transport: { type: 'ws', options: { url: 'wss://server:8443', pongPassword: 'pw', reconnect: { enabled: true } } } });
+ *   await c.connect();
+ *   // attached
+ *   const ws = new WebSocket('wss://server:8443');
+ *   const c2 = new Client({ transport: { type: 'ws', options: { pongPassword: 'pw' } } });
+ *   c2.attachWs(ws);
+ *
+ * IPC Parent (holds child):
+ *   const cp = fork('child.js', { stdio: ['inherit','inherit','inherit','ipc'] });
+ *   const c = new Client({ transport: { type: 'ipc-parent', options: { child: cp, pongPassword: 'pw' } } });
+ *
+ * IPC Child (runs in child):
+ *   // in child.js
+ *   const c = new Client({ transport: { type: 'ipc-child', options: { pongPassword: 'pw' } } });
+ *
+ * Electron renderer:
+ *   // in renderer preload/renderer
+ *   const c = new Client({ transport: { type: 'electron-ipc-renderer', options: { pongPassword: 'pw' } } });
+ *   // or inject ipcRenderer explicitly (for tests/sandbox):
+ *   const c2 = new Client({ transport: { type: 'electron-ipc-renderer', options: { ipcRenderer, pongPassword: 'pw' } } });
+ *
+ * Notes:
+ * - HTTP returns ACK inline; WS/IPCs/Electron send ACK as messages.
+ * - Comments intentionally in English only.
  */
 export class Client {
-  private readonly t: Transport;
-  private readonly caps: TransportCapabilities;
+  private http?: HttpClient;
+  private ws?: WsClient;
+  private ipcp?: IpcParentClient;
+  private ipcc?: IpcChildClient;
+  private elr?: ElectronIpcRendererClient;
 
-  private subs = new Map<string, Set<SubscribeHandler>>();
-  private pending = new Map<string, (data: any) => void>();
-
-  constructor(opts: ClientOptions) {
-    this.t =
-      typeof (opts.transport as any).kind === 'function'
-        ? (opts.transport as Transport)
-        : this.makeTransport(opts.transport as TransportConfig);
-
-    this.caps = this.t.capabilities();
-
-    // Register handlers BEFORE connect to avoid races.
-    this.t.onRawBatch(async (batch, ctx) => {
-      await this.t.ackOutbox(this.buildAck(batch), ctx);
-      await this.dispatchBatch(batch);
-    });
-
-    if (this.t.onRawEnvelope) {
-      this.t.onRawEnvelope((env) => this.routeRawEnvelope(env));
+  constructor(
+    opts:
+      | { transport: { type: 'http'; inbound: HttpInboundOptions; query: HttpQueryOptions } }
+      | { transport: { type: 'ws'; options: ConstructorParameters<typeof WsClient>[0] } }
+      | { transport: { type: 'ipc-parent'; options: ConstructorParameters<typeof IpcParentClient>[0] } }
+      | { transport: { type: 'ipc-child'; options: ConstructorParameters<typeof IpcChildClient>[0] } }
+      | {
+          transport: {
+            type: 'electron-ipc-renderer';
+            options?: ConstructorParameters<typeof ElectronIpcRendererClient>[0];
+          };
+        }
+  ) {
+    switch (opts.transport.type) {
+      case 'http':
+        this.http = new HttpClient(opts.transport.inbound, opts.transport.query);
+        break;
+      case 'ws':
+        this.ws = new WsClient(opts.transport.options);
+        break;
+      case 'ipc-parent':
+        this.ipcp = new IpcParentClient(opts.transport.options);
+        break;
+      case 'ipc-child':
+        this.ipcc = new IpcChildClient(opts.transport.options);
+        break;
+      case 'electron-ipc-renderer':
+        this.elr = new ElectronIpcRendererClient(opts.transport.options);
+        break;
+      default:
+        throw new Error('[client] unknown transport');
     }
+  }
 
-    // Fire-and-forget connect.
-    void this.t.connect();
+  // ---- subscriptions ----
+  subscribe<T = any>(constructorName: string, handler: (evt: T) => unknown | Promise<unknown>): () => void {
+    if (this.http) return this.http.subscribe<T>(constructorName, handler);
+    if (this.ws) return this.ws.subscribe<T>(constructorName, handler);
+    if (this.ipcp) return this.ipcp.subscribe<T>(constructorName, handler);
+    if (this.ipcc) return this.ipcc.subscribe<T>(constructorName, handler);
+    if (this.elr) return this.elr.subscribe<T>(constructorName, handler);
+    throw new Error('[client] no transport');
+  }
+  getSubscriptionCount(constructorName: string): number {
+    if (this.http) return this.http.getSubscriptionCount(constructorName);
+    if (this.ws) return this.ws.getSubscriptionCount(constructorName);
+    if (this.ipcp) return this.ipcp.getSubscriptionCount(constructorName);
+    if (this.ipcc) return this.ipcc.getSubscriptionCount(constructorName);
+    if (this.elr) return this.elr.getSubscriptionCount(constructorName);
+    return 0;
+  }
+
+  // ---- query ----
+  async query<TReq, TRes>(name: string, dto?: TReq, timeoutMs?: number): Promise<TRes> {
+    let raw: any;
+    if (this.http) raw = await this.http.query<TRes>({ name, dto });
+    else if (this.ws) raw = await this.ws.query<TRes>(uuid(), { name, dto } as QueryRequestPayload, timeoutMs ?? 5_000);
+    else if (this.ipcp) raw = await this.ipcp.query<TReq, TRes>(name, dto, timeoutMs ?? 5_000);
+    else if (this.ipcc) raw = await this.ipcc.query<TReq, TRes>(name, dto, timeoutMs ?? 5_000);
+    else if (this.elr) raw = await this.elr.query<TReq, TRes>(name, dto, timeoutMs ?? 5_000);
+    else throw new Error('[client] no transport');
+
+    return this.postProcess(name, raw) as TRes;
+  }
+
+  // ---- HTTP handlers (only when type=http) ----
+  nodeHttpHandler() {
+    if (!this.http) throw new Error('[client] nodeHttpHandler is HTTP-only');
+    return this.http.nodeHttpHandler;
+  }
+  expressRouter() {
+    if (!this.http) throw new Error('[client] expressRouter is HTTP-only');
+    return this.http.expressRouter();
+  }
+
+  // ---- WS lifecycle helpers ----
+  async connect(): Promise<void> {
+    if (this.ws) return this.ws.connect();
+    // Other transports do not need explicit connect
+  }
+  attachWs(socket: any): void {
+    if (!this.ws) throw new Error('[client] attachWs is WS-only');
+    this.ws.attach(socket);
   }
 
   async close(): Promise<void> {
-    // Ensure transport disconnects and removes listeners/sockets
-    await this.t.disconnect();
-    // Clear pending resolvers to avoid leaks
-    this.pending.clear();
-    this.subs.clear();
+    if (this.ws) return this.ws.close();
+    if (this.http) return this.http.close();
+    if (this.ipcp) return this.ipcp.close();
+    if (this.ipcc) return this.ipcc.close();
+    if (this.elr) return this.elr.close();
   }
 
-  private makeTransport(cfg: TransportConfig): Transport {
-    switch (cfg.type) {
-      case 'ws':
-        return new WsNodeTransport(cfg.options);
-      case 'ipc-parent':
-        return new IpcParentTransport(cfg.options);
-      case 'http':
-        return new HttpRpcClient(cfg.options);
-      default:
-        throw new Error('[client-node] unknown transport type');
+  // ---- internal helpers ----
+  private postProcess(name: string, data: any) {
+    if (name === 'GetModelsQuery') {
+      return this.parsePayload1D(data);
     }
-  }
-
-  private buildAck(b: OutboxStreamBatchPayload): OutboxStreamAckPayload {
-    return { ackFromOffset: b.fromOffset, ackToOffset: b.toOffset, streamId: b.streamId };
-  }
-
-  private async dispatchBatch(batch: OutboxStreamBatchPayload) {
-    for (const wire of batch.events) {
-      const ctorName = wire.eventType || wire.type || 'UnknownEvent';
-      const set = this.subs.get(ctorName);
-      if (!set?.size) continue;
-
-      const evt = createDomainEventFromWire(wire);
-      for (const h of set) {
-        await h(evt);
-      }
+    if (name === 'FetchEventsQuery') {
+      return this.parsePayload1D(data);
     }
+    return data;
   }
 
-  private routeRawEnvelope(env: Envelope) {
-    if (isAction(env.action as string, 'QueryResponse') && env.requestId) {
-      const resolver = this.pending.get(env.requestId);
-      if (resolver) {
-        const payload = env.payload as QueryResponsePayload<any>;
-        this.pending.delete(env.requestId);
-        if (payload?.ok === false) throw new Error(String(payload.err ?? 'query failed'));
-        resolver(payload?.data ?? (payload as any)?.payload);
-      }
+  private parsePayload1D(arr: any): any {
+    if (!Array.isArray(arr)) return arr;
+    return arr.map((item) => this.parseItemPayload(item));
+  }
+
+  private parsePayload2D(arr2d: any): any {
+    if (!Array.isArray(arr2d)) return arr2d;
+    return arr2d.map((inner) => (Array.isArray(inner) ? inner.map((item) => this.parseItemPayload(item)) : inner));
+  }
+
+  private parseItemPayload(item: any) {
+    if (!item || typeof item !== 'object') return item;
+    const next = { ...item };
+    const p = (next as any).payload;
+    if (typeof p === 'string') {
+      (next as any).payload = this.safeJsonParse(p);
     }
+    return next;
   }
 
-  // PUBLIC API
-
-  subscribe<T = any>(constructorName: string, handler: SubscribeHandler<T>): () => void {
-    const set = this.subs.get(constructorName) ?? new Set();
-    set.add(handler as any);
-    this.subs.set(constructorName, set);
-    return () => set.delete(handler as any);
-  }
-
-  getSubscriptionCount(constructorName: string): number {
-    return this.subs.get(constructorName)?.size ?? 0;
-  }
-
-  /**
-   * Send a query and resolve by QueryResponse (WS/IPC) or inline HTTP reply.
-   * If transport returns undefined, wait for onRawEnvelope to resolve (with timeout).
-   */
-  async query<TReq, TRes>(requestId: string, body: QueryRequestPayload<TReq>, timeoutMs = 5_000): Promise<TRes> {
-    if (!this.caps.canQuery || !this.t.query) {
-      throw new Error('[client-node] query is not supported by transport');
+  private safeJsonParse(s: string) {
+    try {
+      return JSON.parse(s);
+    } catch {
+      return s;
     }
-
-    let resolveFn!: (v: any) => void;
-    const p = new Promise<TRes>((resolve) => {
-      resolveFn = resolve;
-    });
-    this.pending.set(requestId, resolveFn);
-
-    const inline = await this.t.query<TReq, TRes>(requestId, body);
-    if (inline !== undefined) {
-      this.pending.delete(requestId);
-      return inline;
-    }
-
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (!this.pending.has(requestId)) {
-        return await p;
-      }
-
-      await new Promise((r) => setTimeout(r, 20));
-    }
-    this.pending.delete(requestId);
-    throw new Error('[client-node] query timeout');
-  }
-
-  /** Convenience helper that generates a requestId internally. */
-  async querySimple<TReq, TRes>(constructorName: string, dto?: TReq, timeoutMs = 5_000): Promise<TRes> {
-    const rid = uuid();
-    return this.query<TReq, TRes>(rid, { constructorName, dto }, timeoutMs);
   }
 }

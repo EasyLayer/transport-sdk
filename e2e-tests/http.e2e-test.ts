@@ -1,93 +1,100 @@
-import http from 'http';
 import { Client } from '@easylayer/transport-sdk';
-import { Actions } from '@easylayer/transport-sdk';
+import { Actions, type Envelope } from '@easylayer/transport-sdk';
+import { createServer } from 'node:http';
 
-const wait = (ms: number) => new Promise(r => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const waitFor = async (cond: () => boolean, t = 3000) => { const d = Date.now() + t; while (Date.now() < d) { if (cond()) return; await sleep(20); } throw new Error('waitFor timeout'); };
 
-describe('HTTP e2e', () => {
-  let server: http.Server;
-  let port: number;
+async function getFreePort(): Promise<number> {
+  const s = createServer();
+  await new Promise<void>(r => s.listen(0, '127.0.0.1', r));
+  const port = (s.address() as any).port as number;
+  await new Promise<void>(r => s.close(() => r()));
+  return port;
+}
+
+describe('HTTP Node transport: webhook (streams) + HTTP query @ /query', () => {
+  let client: Client;
+  let appServer: ReturnType<typeof createServer>;
+  let webhookUrl: string;
+  let appBaseUrl: string;
 
   beforeAll(async () => {
-    server = http.createServer((req, res) => {
-      if (req.method === 'POST' && req.url === '/rpc') {
-        let body = '';
-        req.on('data', chunk => (body += chunk));
-        req.on('end', () => {
-          const env = JSON.parse(body || '{}');
-          if (env.action === Actions.QueryRequest) {
-            const resp = {
-              action: Actions.QueryResponse,
-              requestId: env.requestId,
-              payload: { ok: true, data: { via: 'http' } },
-            };
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(resp));
-            return;
-          }
-          res.statusCode = 400; res.end();
-        });
-        return;
+    // mock "application" RPC server at baseUrl + '/query'
+    const appPort = await getFreePort();
+    appBaseUrl = `http://127.0.0.1:${appPort}`;
+    appServer = createServer(async (req, res) => {
+      if (req.method === 'POST' && req.url === '/query') {
+        const body = await new Promise<string>(resolve => { let b = ''; req.on('data', (c: Buffer) => (b += c)); req.on('end', () => resolve(b)); });
+        const env = JSON.parse(body || '{}') as Envelope;
+        const reply: Envelope = { action: Actions.QueryResponse, requestId: env.requestId, payload: { ok: true, data: { via: 'http' } } };
+        res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(reply)); return;
       }
       res.statusCode = 404; res.end();
     });
-    await new Promise<void>(resolve => server.listen(0, resolve));
-    port = (server.address() as any).port;
-  });
+    await new Promise<void>(r => appServer.listen(appPort, '127.0.0.1', r));
 
-  afterAll(async () => {
-    await new Promise<void>(resolve => server.close(() => resolve()));
-  });
+    // webhook URL (transport will host the server itself). No token for simplicity.
+    const hookPort = await getFreePort();
+    webhookUrl = `http://127.0.0.1:${hookPort}/events`;
 
-  it('query via HTTP returns inline QueryResponse', async () => {
-    const client = new Client({
-      transport: { type: 'http', options: { baseUrl: `http://127.0.0.1:${port}`, rpcPath: '/rpc' } }
-    });
-
-    const res = await client.querySimple<{}, { via: string }>('GetStatus', {});
-    expect(res).toEqual({ via: 'http' });
-  }, 10000);
-
-  it('stream forwarding via injectEnvelope -> client subscription', async () => {
-    // Create a client with HTTP transport but we will inject a batch locally through transport
-    const client = new Client({
+    // SDK client (node/http transport)
+    client = new Client({
       transport: {
         type: 'http',
         options: {
-          baseUrl: `http://127.0.0.1:${port}`,
-          rpcPath: '/rpc',
-          // no forwardWebhook: we will dispatch locally through injectEnvelope for test
-        }
-      }
+          webhook: { url: webhookUrl },            // token?: 'secret' if you want to test auth header
+          query:   { baseUrl: appBaseUrl },
+        } as any,
+      },
     });
+  });
+
+  afterAll(async () => {
+    await (client as any)?.close?.();
+    await new Promise<void>(r => appServer.close(() => r()));
+  });
+
+  it('GET /ping replies Pong; POST batch to webhook returns ACK and delivers events', async () => {
+    // sanity: /ping
+    const pingRes = await fetch(webhookUrl.replace('/events', '/ping'), { method: 'GET' });
+    expect(pingRes.ok).toBe(true);
+    const pong = await pingRes.json();
+    expect(pong?.action).toBe(Actions.Pong);
 
     const seen: number[] = [];
-    client.subscribe('BlockAddedEvent', (e: any) => { seen.push(e.payload.n); });
+    const unsub = client.subscribe('BlockAddedEvent', (e: any) =>
+      seen.push(e.blockHeight ?? e.payload?.height ?? -1)
+    );
 
-    // We need access to transport to call injectEnvelope; in real tests you'd keep ref to transport instance.
-    // For this e2e we construct a parallel HttpRpcClient and call injectEnvelope on it,
-    // which would use client's onRawBatch via the shared transport instance in the client impl.
-    // If your implementation hides transport, consider exposing a small "inject" helper for test-only builds.
-
-    // @ts-ignore - reach into internals for test
-    const transport = (client as any).t;
-    const batchEnv = {
+    // simulate app -> post batch to our webhook
+    const batchEnv: Envelope = {
       action: Actions.OutboxStreamBatch,
+      correlationId: 'c1',
       payload: {
-        streamId: 's',
-        fromOffset: 0,
-        toOffset: 2,
+        streamId: 's1', fromOffset: 0, toOffset: 2,
         events: [
-          { id: '1', eventType: 'BlockAddedEvent', payload: { n: 1 } },
-          { id: '2', eventType: 'BlockAddedEvent', payload: { n: 2 } },
+          { id: '1', eventType: 'BlockAddedEvent', payload: { height: 0 } },
+          { id: '2', eventType: 'BlockAddedEvent', payload: { height: 1 } },
+          { id: '3', eventType: 'BlockAddedEvent', payload: { height: 2 } },
         ],
       },
     };
+    const res = await fetch(webhookUrl, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(batchEnv),
+    });
+    expect(res.ok).toBe(true);
+    const ack = (await res.json()) as Envelope;
+    expect(ack.action).toBe(Actions.OutboxStreamAck);
 
-    await transport.injectEnvelope(batchEnv, { transport: 'http' });
+    await waitFor(() => seen.length >= 3, 3000);
+    expect(seen).toEqual([0, 1, 2]);
 
-    // allow event loop to flush handlers
-    await wait(50);
-    expect(seen).toEqual([1, 2]);
-  }, 10000);
+    unsub();
+  });
+
+  it('query over HTTP (POST /query) returns inline response', async () => {
+    const out = await client.querySimple<{}, { via: string }>('GetStatus', {});
+    expect(out).toEqual({ via: 'http' });
+  });
 });
