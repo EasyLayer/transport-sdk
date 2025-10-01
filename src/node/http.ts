@@ -1,13 +1,7 @@
 import { URL } from 'node:url';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import express from 'express';
-import type {
-  Message,
-  OutboxStreamAckPayload,
-  OutboxStreamBatchPayload,
-  QueryRequestPayload,
-  QueryResponsePayload,
-} from '../core';
+import type { Message, OutboxStreamAckPayload, OutboxStreamBatchPayload, QueryResponsePayload } from '../core';
 import { Actions, createDomainEventFromWire, utf8Len, TRANSPORT_OVERHEAD_WIRE } from '../core';
 
 export type HttpInboundOptions = {
@@ -28,6 +22,9 @@ export type HttpInboundOptions = {
 export type HttpQueryOptions = {
   /** Application base URL for queries; will POST to `${baseUrl}/query`. */
   baseUrl: string;
+
+  /** Optional default query timeout (AbortController). Default: 5000 ms. */
+  defaultQueryTimeoutMs?: number;
 };
 
 export type SubscribeHandler<T = any> = (evt: T) => unknown | Promise<unknown>;
@@ -53,6 +50,7 @@ export class HttpClient {
   private readonly maxBytes: number;
   private readonly processTimeoutMs: number;
   private readonly queryBase: string;
+  private readonly defaultQueryTimeoutMs: number;
 
   // One handler per event type
   private subs = new Map<string, SubscribeHandler>();
@@ -69,6 +67,7 @@ export class HttpClient {
 
     this.pingPath = (inbound.pingUrl ? new URL(inbound.pingUrl).pathname : '/ping').replace(/\/+$/, '') || '/ping';
     this.queryBase = query.baseUrl.replace(/\/+$/, '');
+    this.defaultQueryTimeoutMs = Math.max(1, query.defaultQueryTimeoutMs ?? 5000);
   }
 
   /** Subscribe a handler to a specific DomainEvent constructor name. */
@@ -85,17 +84,29 @@ export class HttpClient {
   }
 
   // ---- query out ----
-  async query<TRes = any>(req: QueryRequestPayload): Promise<TRes> {
-    const body = JSON.stringify({ name: req.name, dto: req.dto });
+  async query<TReq = any, TRes = any>(name: string, dto?: TReq, timeoutMs?: number): Promise<TRes> {
+    const body = JSON.stringify({ name, dto });
     if (utf8Len(body) + TRANSPORT_OVERHEAD_WIRE > this.maxBytes) {
       throw new Error('[client-http] query payload too large');
     }
 
-    const res = await fetch(this.queryBase + '/query', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-    });
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), Math.max(1, timeoutMs ?? this.defaultQueryTimeoutMs));
+
+    let res: Response;
+    try {
+      res = await fetch(this.queryBase + '/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        signal: controller.signal,
+      });
+    } catch (e: any) {
+      clearTimeout(t);
+      if (e?.name === 'AbortError') throw new Error('[client-http] query timeout');
+      throw e;
+    }
+    clearTimeout(t);
 
     if (!res.ok) {
       const text = await safeReadText(res);

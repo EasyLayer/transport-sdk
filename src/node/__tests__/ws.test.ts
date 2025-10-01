@@ -145,9 +145,9 @@ describe('WsClient', () => {
     sock.openNow();
     await p;
 
-    const wait = client.query<any>({ name: 'GetThing', dto: { id: 1 } });
+    const wait = client.query<any>('GetThing', { id: 1 });
 
-    await expect(client.query({ name: 'Second', dto: {} })).rejects.toThrow(/in flight/i);
+    await expect(client.query('Second', {})).rejects.toThrow(/in flight/i);
 
     const resp: Message = {
       action: Actions.QueryResponse,
@@ -168,6 +168,6 @@ describe('WsClient', () => {
 
     (client as any).maxBytes = 16;
 
-    await expect(client.query({ name: 'Big', dto: { s: 'x'.repeat(100) } })).rejects.toThrow(/too large/i);
+    await expect(client.query('Big', { s: 'x'.repeat(100) })).rejects.toThrow(/too large/i);
   });
 });

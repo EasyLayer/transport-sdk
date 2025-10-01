@@ -55,6 +55,7 @@ import { ElectronIpcRendererClient } from './electron-ipc-renderer';
  *   // or inject ipcRenderer explicitly (for tests/sandbox):
  *   const c2 = new Client({ transport: { type: 'electron-ipc-renderer', options: { ipcRenderer, pongPassword: 'pw' } } });
  *
+ *
  * Notes:
  * - HTTP returns ACK inline; WS/IPCs/Electron send ACK as messages.
  * - Comments intentionally in English only.
@@ -113,8 +114,8 @@ export class Client {
   // ---- query ----
   async query<TReq, TRes>(name: string, dto?: TReq, timeoutMs?: number): Promise<TRes> {
     let raw: any;
-    if (this.http) raw = await this.http.query<TRes>({ name, dto });
-    else if (this.ws) raw = await this.ws.query<TRes>({ name, dto });
+    if (this.http) raw = await this.http.query<TReq, TRes>(name, dto, timeoutMs ?? 5_000);
+    else if (this.ws) raw = await this.ws.query<TReq, TRes>(name, dto, timeoutMs ?? 5_000);
     else if (this.ipcp) raw = await this.ipcp.query<TReq, TRes>(name, dto, timeoutMs ?? 5_000);
     else if (this.ipcc) raw = await this.ipcc.query<TReq, TRes>(name, dto, timeoutMs ?? 5_000);
     else if (this.elr) raw = await this.elr.query<TReq, TRes>(name, dto, timeoutMs ?? 5_000);

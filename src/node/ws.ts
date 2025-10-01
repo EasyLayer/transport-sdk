@@ -2,13 +2,7 @@
 import WebSocket from 'ws';
 /* eslint-enable no-restricted-syntax */
 import { Actions, createDomainEventFromWire, utf8Len, TRANSPORT_OVERHEAD_WIRE } from '../core';
-import type {
-  Message,
-  OutboxStreamBatchPayload,
-  OutboxStreamAckPayload,
-  QueryRequestPayload,
-  QueryResponsePayload,
-} from '../core';
+import type { Message, OutboxStreamBatchPayload, OutboxStreamAckPayload, QueryResponsePayload } from '../core';
 
 export type WsClientOptions = {
   url: string; // e.g. wss://server:8443/ws
@@ -119,23 +113,50 @@ export class WsClient {
   }
 
   // ---- query ---------------------------------------------------------------
-  async query<TRes = any>(req: QueryRequestPayload): Promise<TRes> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('[ws-client] not connected');
-    if (this.queryInFlight) throw new Error('[ws-client] query in flight');
+  /**
+   * Single-flight query with one deadline for the whole operation.
+   * `timeoutMs` covers both sending and receiving a response.
+   * Default: 5000 ms.
+   */
+  async query<TReq = any, TRes = any>(name: string, dto?: TReq, timeoutMs = 5000): Promise<TRes> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('[ws-client] not connected');
+    }
+    if (this.queryInFlight) {
+      throw new Error('[ws-client] query in flight');
+    }
 
-    const payload = {
+    const payload: Message = {
       action: Actions.QueryRequest,
       timestamp: Date.now(),
-      payload: { name: req.name, dto: req.dto },
-    } as Message;
-    const s = JSON.stringify(payload);
-    if (utf8Len(s) + TRANSPORT_OVERHEAD_WIRE > this.maxBytes) throw new Error('[ws-client] query payload too large');
+      payload: { name, dto },
+    } as any;
 
-    const p = new Promise<TRes>((resolve, reject) => {
-      this.queryInFlight = { resolve, reject };
-    });
-    this.ws.send(s);
-    return p;
+    const s = JSON.stringify(payload);
+    if (utf8Len(s) + TRANSPORT_OVERHEAD_WIRE > this.maxBytes) {
+      throw new Error('[ws-client] query payload too large');
+    }
+
+    return this.withDeadline<TRes>(async (deadlineAt) => {
+      let resolveFn!: (v: TRes) => void;
+      let rejectFn!: (e: any) => void;
+      const waiter = new Promise<TRes>((resolve, reject) => {
+        resolveFn = resolve;
+        rejectFn = reject;
+      });
+
+      if (this.queryInFlight) throw new Error('[ws-client] query in flight');
+      this.queryInFlight = { resolve: resolveFn, reject: rejectFn };
+
+      try {
+        await this.sendTextBeforeDeadline(s, deadlineAt);
+      } catch (e) {
+        this.queryInFlight = null;
+        throw e;
+      }
+
+      return waiter;
+    }, timeoutMs);
   }
 
   /* eslint-disable no-empty */
@@ -191,6 +212,7 @@ export class WsClient {
         break;
     }
   };
+  /* eslint-enable no-empty */
 
   // ---- batch processing -----------------------------------------------------
   private async processBatchWithTimeout(batch: OutboxStreamBatchPayload): Promise<void> {
@@ -231,6 +253,7 @@ export class WsClient {
     await Promise.all(tasks);
   }
 
+  // ---- helpers --------------------------------------------------------------
   private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('batch processing timeout')), ms);
@@ -244,6 +267,55 @@ export class WsClient {
           reject(e);
         }
       );
+    });
+  }
+
+  /** Run `fn` with a hard deadline (Date.now() + timeoutMs). */
+  private async withDeadline<T>(fn: (deadlineAt: number) => Promise<T>, timeoutMs: number): Promise<T> {
+    const deadlineAt = Date.now() + Math.max(1, timeoutMs);
+    let timer: any;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => {
+          // clear single-flight guard if still pending
+          const inflight = this.queryInFlight;
+          this.queryInFlight = null;
+          inflight?.reject?.(new Error('query response timeout'));
+          reject(new Error('query timeout'));
+        },
+        Math.max(1, timeoutMs)
+      );
+    });
+    try {
+      const result = await Promise.race([fn(deadlineAt), timeoutPromise]);
+      clearTimeout(timer);
+      return result as T;
+    } catch (e) {
+      clearTimeout(timer);
+      throw e;
+    }
+  }
+
+  /** Send a text frame before a given deadline; throws on timeout or send error. */
+  private sendTextBeforeDeadline(text: string, deadlineAt: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        return reject(new Error('[ws-client] not connected'));
+      }
+      const now = Date.now();
+      const remaining = Math.max(1, deadlineAt - now);
+      let timer: any;
+      try {
+        timer = setTimeout(() => reject(new Error('send timeout')), remaining);
+        this.ws.send(text, (err) => {
+          clearTimeout(timer);
+          if (err) reject(err);
+          else resolve();
+        });
+      } catch (e: any) {
+        clearTimeout(timer);
+        reject(e);
+      }
     });
   }
 

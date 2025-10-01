@@ -122,8 +122,9 @@ describe('Client (unit)', () => {
     });
 
     const res = await c.query('SomeQuery', { a: 1 });
+
     expect(httpQuery).toHaveBeenCalledTimes(1);
-    expect(httpQuery).toHaveBeenCalledWith({ name: 'SomeQuery', dto: { a: 1 } });
+    expect(httpQuery).toHaveBeenCalledWith('SomeQuery', { a: 1 }, expect.any(Number));
     expect(res).toEqual({ ok: true, via: 'http' });
   });
 
