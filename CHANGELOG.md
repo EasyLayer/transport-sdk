@@ -1,3 +1,14 @@
+## 1.2.0 (2025-10-01)
+
+* chore: updated docs; ([b029f7e](https://github.com/easylayer/transport-sdk/commit/b029f7e))
+* refactor: added ipc transports; fixed ws transport and unit tests; ([468f7bf](https://github.com/easylayer/transport-sdk/commit/468f7bf))
+* refactor: refactored all transports; ([1224aef](https://github.com/easylayer/transport-sdk/commit/1224aef))
+* refactor: refactored htt, ws, ipc transports; ([330f08d](https://github.com/easylayer/transport-sdk/commit/330f08d))
+* BREAKING: refactored all components; added browser version; ([19f0ff7](https://github.com/easylayer/transport-sdk/commit/19f0ff7))
+* BREAKING: refactored entire logic; ([c8fe263](https://github.com/easylayer/transport-sdk/commit/c8fe263))
+
+
+
 ## <small>1.1.1 (2025-07-16)</small>
 
 * chore: updated docs; ([da4c50a](https://github.com/easylayer/transport-sdk/commit/da4c50a))

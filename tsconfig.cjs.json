@@ -12,6 +12,7 @@
   "references": [],
   "include": ["src"],
   "exclude": [
+    "src/browser",
     "scripts",
     "e2e-tests",
     "dist",
