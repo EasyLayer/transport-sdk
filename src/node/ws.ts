@@ -1,340 +1,331 @@
-import type { Message, OutboxStreamAckPayload, OutboxStreamBatchPayload, QueryRequestPayload } from '../core';
-import { Actions, createDomainEventFromWire } from '../core';
-import { normalize, computeBackoff, delay, nextBackoff } from '../core';
+/* eslint-disable no-restricted-syntax */
+import WebSocket from 'ws';
+/* eslint-enable no-restricted-syntax */
+import { Actions, createDomainEventFromWire, utf8Len, TRANSPORT_OVERHEAD_WIRE } from '../core';
+import type {
+  Message,
+  OutboxStreamBatchPayload,
+  OutboxStreamAckPayload,
+  QueryRequestPayload,
+  QueryResponsePayload,
+} from '../core';
+
+export type WsClientOptions = {
+  url: string; // e.g. wss://server:8443/ws
+  token?: string; // sent in Sec-WebSocket-Protocol (first protocol)
+  clientId?: string; // sent in Sec-WebSocket-Protocol (second protocol)
+  pongPassword?: string; // included in Pong payload when replying to app-level Ping
+  maxWireBytes?: number; // default 1 MiB
+  processTimeoutMs?: number; // default 3000
+  /**
+   * Optional factory for creating WebSocket instances in managed mode.
+   * If provided, connect() and internal reconnects will use this factory.
+   */
+  socketFactory?: () => WebSocket;
+};
 
 /**
  * WsClient
  * -----------------------------------------------------------------------------
- * Role:
- * - Owns a WebSocket client connection to the server (ws/wss URL), OR can attach
- *   to an externally created socket (via `attach()`), so the host app can manage
- *   the socket lifecycle itself.
- *
- * Inbound:
- * - 'ping'                 -> reply 'pong' with optional { password }.
- * - 'outbox.stream.batch'  -> fan-out events to subscribers by eventType,
- *                             then send 'outbox.stream.ack' with { ok, okIndices }.
- * - 'query.response'       -> resolve pending promise by requestId.
- * - Custom messages        -> available via `tapRaw()` and `onAction(action, handler)`.
- *
- * Outbound:
- * - 'query.request'        -> send with requestId and payload { name, data }.
- * - `sendRaw(frame)`       -> send any envelope/string as-is for custom protocols.
- *
- * Reliability:
- * - Optional auto-reconnect with backoff (disabled by default). When enabled,
- *   will reopen the socket after 'close'/'error' using exponential backoff.
- *
- * Cleanup:
- * - `close()` stops reconnects, removes handlers, and closes the socket.
+ * - Managed mode (connect): creates and owns a socket; auto-reconnects forever with backoff.
+ * - Attached mode (attach): uses an external socket; NO internal reconnects.
+ * - App-level Ping/Pong: replies with Pong (optionally with password) → server turns online.
+ * - Outbox batches: per-type sequential, cross-type parallel; one ACK on success.
+ * - Query: single-flight (no parallel queries); QueryRequest → QueryResponse.
  */
 export class WsClient {
-  private socket?: WebSocketLike;
-  private url?: string;
+  private readonly url: string;
+  private token?: string;
+  private clientId?: string;
+  private readonly pongPassword?: string;
+  private readonly maxBytes: number;
+  private readonly processTimeoutMs: number;
+  private readonly socketFactory?: () => WebSocket;
 
-  private reconnect?: { min: number; max: number; factor: number; jitter: number; enabled: boolean };
-  private reconnectTimer?: NodeJS.Timeout;
-  private closedManually = false;
+  private ws: WebSocket | null = null;
+  private ownsSocket = false; // true when we created the socket (managed mode)
+  private reconnecting = false; // internal guard against concurrent reconnect loops
+  private connAttempts = 0; // increases while reconnecting in managed mode
 
-  private subs = new Map<string, Set<(evt: any) => unknown | Promise<unknown>>>();
-  private pendingQueries = new Map<string, (payload: any) => void>();
+  // subscriptions: one handler per event type
+  private subs = new Map<string, (evt: any) => unknown | Promise<unknown>>();
 
-  private rawHandlers = new Set<(m: Message) => void>();
-  private actionHandlers = new Map<string, Set<(m: Message) => void>>();
+  // single-flight query waiting
+  private queryInFlight: { resolve: (v: any) => void; reject: (e: any) => void } | null = null;
 
-  constructor(
-    private readonly opts: {
-      /** ws:// or wss:// URL. Required if you do not call attach(). */
-      url?: string;
-      /** If provided, will be included in Pong payload as { password }. */
-      pongPassword?: string;
-      /** Optional headers for Node 'ws' constructor. Ignored in browsers. */
-      headers?: Record<string, string>;
-      /** Optional custom WebSocket constructor (e.g., global WebSocket in browser). */
-      WebSocketCtor?: WebSocketCtor;
-      /** Auto-reconnect settings (disabled by default). */
-      reconnect?: { minMs?: number; maxMs?: number; factor?: number; jitter?: number; enabled?: boolean };
-    }
-  ) {
-    this.url = opts?.url;
-    const r = opts?.reconnect ?? {};
-    this.reconnect = {
-      min: Math.max(100, r.minMs ?? 500),
-      max: Math.max(1000, r.maxMs ?? 5000),
-      factor: Math.max(1.1, r.factor ?? 1.6),
-      jitter: Math.max(0, r.jitter ?? 0.2),
-      enabled: !!r.enabled,
-    };
+  constructor(opts: WsClientOptions) {
+    if (!opts?.url) throw new Error('[ws-client] url is required');
+    this.url = opts.url;
+    this.token = opts.token;
+    this.clientId = opts.clientId;
+    this.pongPassword = opts.pongPassword;
+    this.maxBytes = Math.max(1024, opts.maxWireBytes ?? 1024 * 1024);
+    this.processTimeoutMs = Math.max(1, opts.processTimeoutMs ?? 3000);
+    this.socketFactory = opts.socketFactory;
   }
 
-  // -----------------------------------------------------------------------------
-  // Public API — usage examples:
-  // -----------------------------------------------------------------------------
-  // Managed mode:
-  //   const c = new WsClient({ url: 'wss://host:8443', pongPassword: 'pw', reconnect: { enabled: true } });
-  //   await c.connect();
-  //
-  // Attached mode:
-  //   const sock = new WebSocket('wss://host:8443');
-  //   const c = new WsClient({ pongPassword: 'pw' });
-  //   c.attach(sock);
-  //
-  // Custom messages:
-  //   const off1 = c.tapRaw((m) => console.log('raw', m.action));
-  //   const off2 = c.onAction('custom.message', (m) => console.log(m.payload));
-  //   await c.sendRaw({ action: 'custom.request', payload: { x: 1 } });
-
-  // ---------------------------------------------------------------------------
-  // Subscription API
-  // ---------------------------------------------------------------------------
-
-  subscribe<T = any>(constructorName: string, handler: (evt: T) => unknown | Promise<unknown>): () => void {
-    const set = this.subs.get(constructorName) ?? new Set();
-    set.add(handler as any);
-    this.subs.set(constructorName, set);
-    return () => set.delete(handler as any);
-  }
-
-  getSubscriptionCount(constructorName: string): number {
-    return this.subs.get(constructorName)?.size ?? 0;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Extensibility hooks for custom messages
-  // ---------------------------------------------------------------------------
-
-  /** Register a raw envelope interceptor; runs BEFORE built-in routing. */
-  tapRaw(handler: (msg: Message) => void): () => void {
-    this.rawHandlers.add(handler);
-    return () => this.rawHandlers.delete(handler);
-  }
-
-  /** Register a handler for a specific action (e.g., "custom.message"). */
-  onAction(action: string, handler: (msg: Message) => void): () => void {
-    const set = this.actionHandlers.get(action) ?? new Set<(m: Message) => void>();
-    set.add(handler);
-    this.actionHandlers.set(action, set);
-    return () => set.delete(handler);
-  }
-
-  /** Send any JSON-able envelope or string as-is. */
-  async sendRaw(frame: Message | string): Promise<void> {
-    await this.send(frame);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Socket lifecycle
-  // ---------------------------------------------------------------------------
-
-  /** Create and open an internal WebSocket connection. */
+  // ---- lifecycle ------------------------------------------------------------
+  /**
+   * Managed mode:
+   *  - Tries to open a socket.
+   *  - If the first attempt fails (e.g., server not up), it starts an infinite background
+   *    reconnect loop and RESOLVES immediately (soft start).
+   *  - If the first attempt succeeds, resolves after 'open'.
+   */
   async connect(): Promise<void> {
-    if (this.socket && this.socket.readyState === this.socket.OPEN) return;
-    if (!this.url) throw new Error('[client-ws] url is required (or use attach())');
-
-    const ctor = this.opts.WebSocketCtor ?? getNodeWsCtor();
-    const ws = new ctor(this.url, undefined, { headers: this.opts.headers });
-    this.bind(ws);
+    try {
+      await this.openOnce();
+    } catch {
+      // Soft start: start background infinite reconnects and resolve immediately.
+      this.startReconnectLoop();
+    }
   }
 
-  /** Attach to an already open or opening WebSocket created by the host app. */
-  attach(socket: WebSocketLike): void {
-    this.bind(socket);
+  /**
+   * Attach an existing WebSocket. In this mode the client does NOT perform reconnects.
+   * Responsibility for reconnecting stays with the creator of the socket.
+   * Optional creds are stored only for potential future switch to managed mode.
+   */
+  attach(sock: WebSocket, creds?: { token?: string; clientId?: string }) {
+    if (creds?.token) this.token = creds.token;
+    if (creds?.clientId) this.clientId = creds.clientId;
+
+    this.ws = sock;
+    this.ownsSocket = false; // external socket ownership
+    this.bindSocket(sock);
   }
 
   /* eslint-disable no-empty */
-  /** Close and cleanup. Disables auto-reconnect. */
   async close(): Promise<void> {
-    this.closedManually = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = undefined;
-    }
-    if (this.socket && this.socket.readyState === this.socket.OPEN) {
-      try {
-        this.socket.close();
-      } catch {}
-    }
-    this.socket = undefined;
-    this.pendingQueries.clear();
-    this.subs.clear();
-    this.rawHandlers.clear();
-    this.actionHandlers.clear();
+    this.reconnecting = false;
+    try {
+      this.ws?.close(1000, 'client close');
+    } catch {}
+    this.ws = null;
   }
   /* eslint-enable no-empty */
 
-  /* eslint-disable no-empty */
-  private bind(ws: WebSocketLike) {
-    if (this.socket && this.socket !== ws) {
-      try {
-        this.socket.onopen = this.socket.onmessage = this.socket.onclose = this.socket.onerror = null as any;
-      } catch {}
-    }
-
-    this.socket = ws;
-    this.closedManually = false;
-
-    ws.onopen = () => {
-      /* server will drive ping->pong */
-    };
-    ws.onmessage = (ev: { data: any }) => this.handleIncoming(ev.data);
-    ws.onclose = () => this.onClosed();
-    ws.onerror = () => {
-      /* swallow, onclose handles flow */
+  // ---- subscriptions --------------------------------------------------------
+  subscribe<T = any>(eventType: string, handler: (evt: T) => unknown | Promise<unknown>) {
+    if (this.subs.has(eventType)) throw new Error(`[ws-client] duplicate subscription for type "${eventType}"`);
+    this.subs.set(eventType, handler as any);
+    return () => {
+      const cur = this.subs.get(eventType);
+      if (cur === handler) this.subs.delete(eventType);
     };
   }
-  /* eslint-enable no-empty */
-
-  private onClosed() {
-    if (this.closedManually) return;
-    if (!this.reconnect?.enabled || !this.url) return;
-
-    const next = computeBackoff(this.reconnect!);
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnect!.min = Math.min(this.reconnect!.max, this.reconnect!.min * this.reconnect!.factor);
-      void this.connect();
-    }, next);
+  getSubscriptionCount(eventType: string): number {
+    return this.subs.has(eventType) ? 1 : 0;
   }
 
-  // ---------------------------------------------------------------------------
-  // Messaging
-  // ---------------------------------------------------------------------------
+  // ---- query ---------------------------------------------------------------
+  async query<TRes = any>(req: QueryRequestPayload): Promise<TRes> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('[ws-client] not connected');
+    if (this.queryInFlight) throw new Error('[ws-client] query in flight');
+
+    const payload = {
+      action: Actions.QueryRequest,
+      timestamp: Date.now(),
+      payload: { name: req.name, dto: req.dto },
+    } as Message;
+    const s = JSON.stringify(payload);
+    if (utf8Len(s) + TRANSPORT_OVERHEAD_WIRE > this.maxBytes) throw new Error('[ws-client] query payload too large');
+
+    const p = new Promise<TRes>((resolve, reject) => {
+      this.queryInFlight = { resolve, reject };
+    });
+    this.ws.send(s);
+    return p;
+  }
 
   /* eslint-disable no-empty */
-  private async handleIncoming(raw: unknown) {
-    const msg = normalize(raw);
-    if (!msg?.action) return;
-
-    // User raw taps first
-    for (const h of this.rawHandlers) {
-      try {
-        h(msg);
-      } catch {}
+  // ---- inbound message routing --------------------------------------------
+  private onMessage = async (text: string) => {
+    let msg: Message | null = null;
+    try {
+      msg = JSON.parse(text);
+    } catch {
+      return;
     }
-
-    // User action handlers next
-    const ah = this.actionHandlers.get(msg.action);
-    if (ah?.size) {
-      for (const h of ah) {
-        try {
-          h(msg);
-        } catch {}
-      }
-    }
+    if (!msg || typeof (msg as any).action !== 'string') return;
 
     switch (msg.action) {
       case Actions.Ping: {
-        const pong: Message<{ password?: string }> = {
+        const pong: Message = {
           action: Actions.Pong,
-          payload: this.opts.pongPassword ? { password: this.opts.pongPassword } : undefined,
           timestamp: Date.now(),
-        };
-        this.send(pong).catch(() => {});
-        return;
+          payload: this.pongPassword ? { password: this.pongPassword } : undefined,
+        } as any;
+        try {
+          this.ws?.send(JSON.stringify(pong));
+        } catch {}
+        break;
       }
-
       case Actions.OutboxStreamBatch: {
         const p = msg.payload as OutboxStreamBatchPayload;
-        if (!p || !Array.isArray(p.events)) return;
-
-        for (const wire of p.events) {
-          const set = this.subs.get(wire.eventType || 'UnknownEvent');
-          if (!set?.size) continue;
-          const evt = createDomainEventFromWire(wire);
-          for (const h of set) await h(evt);
+        try {
+          await this.processBatchWithTimeout(p);
+          const ack: Message<OutboxStreamAckPayload> = {
+            action: Actions.OutboxStreamAck,
+            timestamp: Date.now(),
+            payload: { ok: true, okIndices: p.events.map((_e, i) => i) },
+          } as any;
+          this.ws?.send(JSON.stringify(ack));
+        } catch {
+          // No ACK on failure — server will retry
         }
-
-        const ack: Message<OutboxStreamAckPayload> = {
-          action: Actions.OutboxStreamAck,
-          timestamp: Date.now(),
-          payload: { ok: true, okIndices: p.events.map((_e, i) => i) },
-        };
-        this.send(ack).catch(() => {});
-        return;
+        break;
       }
-
       case Actions.QueryResponse: {
-        if (!msg.requestId) return;
-        const resolver = this.pendingQueries.get(msg.requestId);
-        if (!resolver) return;
-        this.pendingQueries.delete(msg.requestId);
-
-        const pl: any = msg.payload;
-        if (pl?.ok === false) throw new Error(String(pl?.err ?? 'query failed'));
-        resolver(pl?.data ?? (pl as any)?.payload);
-        return;
+        const qr = msg.payload as QueryResponsePayload as any;
+        const inflight = this.queryInFlight;
+        this.queryInFlight = null;
+        if (!inflight) return;
+        if (!qr || typeof qr.ok !== 'boolean') inflight.reject(new Error('invalid query response'));
+        else if (qr.ok === false) inflight.reject(new Error(String(qr.err ?? 'query failed')));
+        else inflight.resolve(qr.data);
+        break;
       }
-
       default:
-        return;
+        // ignore anything else
+        break;
     }
-  }
-  /* eslint-enable no-empty */
+  };
 
-  private async send(frame: Message | string) {
-    const s = this.socket;
-    if (!s || s.readyState !== s.OPEN) throw new Error('[client-ws] socket is not open');
-    const data = typeof frame === 'string' ? frame : JSON.stringify(frame);
-    s.send(data);
+  // ---- batch processing -----------------------------------------------------
+  private async processBatchWithTimeout(batch: OutboxStreamBatchPayload): Promise<void> {
+    const work = this.dispatchBatch(batch);
+    await this.withTimeout(work, this.processTimeoutMs);
   }
 
-  // ---------------------------------------------------------------------------
-  // Query API
-  // ---------------------------------------------------------------------------
+  private async dispatchBatch(batch: OutboxStreamBatchPayload) {
+    const wires = batch.events ?? [];
+    if (!wires.length) return;
 
-  async query<TRes = any>(requestId: string, payload: QueryRequestPayload, timeoutMs = 5_000): Promise<TRes> {
-    const s = this.socket;
-    if (!s || s.readyState !== s.OPEN) throw new Error('[client-ws] socket is not open');
+    // Build per-type index lists (cheap routing)
+    const perTypeIdx = new Map<string, number[]>();
+    for (let i = 0; i < wires.length; i++) {
+      const w = wires[i]!;
+      if (!this.subs.has(w.eventType)) continue;
+      let arr = perTypeIdx.get(w.eventType);
+      if (!arr) perTypeIdx.set(w.eventType, (arr = []));
+      arr.push(i);
+    }
 
-    const env: Message<QueryRequestPayload> = {
-      action: Actions.QueryRequest,
-      requestId,
-      timestamp: Date.now(),
-      payload,
+    if (perTypeIdx.size === 0) return; // nothing to wait for
+
+    const tasks: Promise<void>[] = [];
+    for (const [type, idxs] of perTypeIdx) {
+      const handler = this.subs.get(type)!;
+      tasks.push(
+        (async () => {
+          for (let k = 0; k < idxs.length; k++) {
+            const wire = wires[idxs[k]!]!;
+            const evt = createDomainEventFromWire(wire);
+            await Promise.resolve().then(() => handler(evt));
+          }
+        })()
+      );
+    }
+
+    await Promise.all(tasks);
+  }
+
+  private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('batch processing timeout')), ms);
+      p.then(
+        (v) => {
+          clearTimeout(t);
+          resolve(v);
+        },
+        (e) => {
+          clearTimeout(t);
+          reject(e);
+        }
+      );
+    });
+  }
+
+  // ---- managed socket (Node-only) ------------------------------------------
+  /**
+   * Opens a socket once (no retry inside). Throws if fails.
+   */
+  private async openOnce(): Promise<void> {
+    const protocols: string[] = [];
+    if (this.token) protocols.push(this.token);
+    if (this.clientId) protocols.push(this.clientId);
+
+    const ws = this.socketFactory
+      ? this.socketFactory()
+      : new WebSocket(this.url, protocols.length ? protocols : undefined);
+
+    this.ws = ws;
+    this.ownsSocket = true; // managed mode
+    this.bindSocket(ws);
+
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', resolve);
+      ws.once('error', reject);
+    });
+  }
+
+  /**
+   * Starts infinite reconnect loop with backoff (managed mode only).
+   * Backoff: 200ms → 400 → 800 → ... up to 3000ms, then steady 3000ms.
+   */
+  private startReconnectLoop() {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+
+    const loop = async () => {
+      while (this.reconnecting) {
+        try {
+          await this.openOnce();
+          this.connAttempts = 0;
+          this.reconnecting = false; // connected
+          return;
+        } catch {
+          this.connAttempts++;
+          const delayMs = this.computeBackoffMs(this.connAttempts);
+          await delay(delayMs);
+        }
+      }
     };
 
-    let resolveFn!: (v: any) => void;
-    const p = new Promise<TRes>((resolve) => (resolveFn = resolve));
-    this.pendingQueries.set(requestId, resolveFn);
+    // fire-and-forget
+    loop().catch(() => {
+      /* noop */
+    });
+  }
 
-    this.send(env).catch((e) => {
-      this.pendingQueries.delete(requestId);
-      throw e;
+  private computeBackoffMs(attempt: number): number {
+    const base = 200; // 0.2s
+    const cap = 3000; // 3s max
+    // exponential growth: 200 * 2^(attempt-1)
+    const ms = base * Math.pow(2, Math.max(0, attempt - 1));
+    return Math.min(cap, ms);
+  }
+
+  private bindSocket(ws: WebSocket) {
+    ws.on('message', (d) => this.onMessage(String(d)));
+
+    ws.on('close', () => {
+      // Only auto-reconnect if we own the socket (managed mode)
+      if (this.ownsSocket) {
+        this.startReconnectLoop();
+      }
     });
 
-    const deadline = Date.now() + timeoutMs;
-    const backoff = { wait: 16 };
-
-    while (Date.now() < deadline) {
-      if (!this.pendingQueries.has(requestId)) return await p;
-      await delay(nextBackoff(backoff, { factor: 1.6, max: 300, jitter: 0.2 }));
-    }
-
-    this.pendingQueries.delete(requestId);
-    throw new Error('[client-ws] query timeout');
+    ws.on('error', () => {
+      // Error may arrive before 'close'; trigger reconnect if managed
+      if (this.ownsSocket) {
+        this.startReconnectLoop();
+      }
+    });
   }
 }
 
-// -----------------------------------------------------------------------------
-// Utilities and types
-// -----------------------------------------------------------------------------
-
-type WebSocketCtor = new (url: string, protocols?: string | string[] | undefined, opts?: any) => WebSocketLike;
-type WebSocketLike = {
-  readonly OPEN: number;
-  readyState: number;
-  send(data: any): void;
-  close(): void;
-  onopen: ((ev?: any) => any) | null;
-  onmessage: ((ev: { data: any }) => any) | null;
-  onclose: ((ev?: any) => any) | null;
-  onerror: ((ev?: any) => any) | null;
-};
-
-function getNodeWsCtor(): WebSocketCtor {
-  try {
-    const WS = require('ws');
-    return WS;
-  } catch {
-    throw new Error('[client-ws] "ws" package is required in Node or provide WebSocketCtor');
-  }
+function delay(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }

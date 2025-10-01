@@ -1,106 +1,169 @@
 import { Client } from '../client';
-import type {
-  Transport, TransportCapabilities, Envelope,
-  OutboxStreamBatchPayload, OutboxStreamAckPayload, BatchContext,
-  QueryRequestPayload, QueryResponsePayload,
-} from '../../core';
-import { Actions } from '../../core';
 
-class MockNodeTransport implements Transport {
-  public ackCalls: OutboxStreamAckPayload[] = [];
-  public sentQueries: Envelope[] = [];
-  public batchHandler?: (b: OutboxStreamBatchPayload, ctx: BatchContext) => Promise<void>;
-  public envHandler?: (e: Envelope, ctx: BatchContext) => void;
+// Mock uuid so ws.query gets a stable requestId
+jest.mock('../../core', () => ({
+  ...jest.requireActual('../../core'),
+  uuid: () => 'fixed-rid',
+}));
 
-  kind() { return 'ws' as any; }
-  capabilities(): TransportCapabilities { return { canQuery: true }; }
+// Prepare module mocks for every transport
+const httpSubscribe = jest.fn();
+const httpQuery = jest.fn();
+const httpNodeHandler = () => ({} as any);
+const httpExpressRouter = () => ({ use: jest.fn() } as any);
+const httpClose = jest.fn();
 
-  async connect() {}
-  async disconnect() {}
-  isConnectedSync(): boolean { return true; }
-  async awaitConnected(): Promise<boolean> { return true; }
-
-  onRawBatch(handler: (b: OutboxStreamBatchPayload, ctx: BatchContext) => Promise<void>) {
-    this.batchHandler = handler;
-  }
-  onRawEnvelope(handler: (e: Envelope, ctx: BatchContext) => void): void {
-    this.envHandler = handler;
-  }
-
-  async ackOutbox(p: OutboxStreamAckPayload): Promise<void> {
-    this.ackCalls.push(p);
-  }
-
-  async query<TReq, TRes>(requestId: string, body: QueryRequestPayload<TReq>): Promise<TRes> {
-    const env: Envelope = { action: Actions.QueryRequest, requestId, payload: body };
-    this.sentQueries.push(env);
-    // Simulate non-inline response: return undefined, test will deliver QueryResponse via envHandler
-    return undefined as unknown as TRes;
-  }
-}
-
-function makeBatch(): OutboxStreamBatchPayload {
+jest.mock('../http', () => {
   return {
-    streamId: 's2',
-    fromOffset: 0,
-    toOffset: 2,
-    events: [
-      { id: 'e1', eventType: 'FooEvent', payload: { a: 1 } },
-      { id: 'e2', eventType: 'BarEvent', payload: { b: 2 } },
-    ],
-    _actionName: Actions.OutboxStreamBatch,
+    HttpClient: jest.fn().mockImplementation((_inbound, _query) => ({
+      subscribe: httpSubscribe,
+      query: httpQuery,
+      nodeHttpHandler: httpNodeHandler,
+      expressRouter: httpExpressRouter,
+      close: httpClose,
+    })),
   };
-}
+});
 
-describe('Node Client (unit)', () => {
-  it('auto-ACK then subscribers', async () => {
-    const t = new MockNodeTransport();
-    const client = new Client({ transport: t as unknown as Transport });
+const wsSubscribe = jest.fn();
+const wsQuery = jest.fn();
+const wsConnect = jest.fn();
+const wsAttach = jest.fn();
+const wsClose = jest.fn();
 
-    const seen: string[] = [];
-    client.subscribe('FooEvent', (evt: any) => { seen.push('Foo:' + evt.payload.a); });
-    client.subscribe('BarEvent', (evt: any) => { seen.push('Bar:' + evt.payload.b); });
+jest.mock('../ws', () => {
+  return {
+    WsClient: jest.fn().mockImplementation((_opts) => ({
+      subscribe: wsSubscribe,
+      query: wsQuery,
+      connect: wsConnect,
+      attach: wsAttach,
+      close: wsClose,
+    })),
+  };
+});
 
-    await t.batchHandler!(makeBatch(), { transport: 'ws', actionStyle: 'dot' });
+const ipcpSubscribe = jest.fn();
+const ipcpQuery = jest.fn();
+const ipcpClose = jest.fn();
 
-    expect(t.ackCalls).toHaveLength(1);
-    expect(t.ackCalls[0]).toEqual({ ackFromOffset: 0, ackToOffset: 2, streamId: 's2' });
-    expect(seen).toEqual(['Foo:1', 'Bar:2']);
+jest.mock('../ipc-parent', () => {
+  return {
+    IpcParentClient: jest.fn().mockImplementation((_opts) => ({
+      subscribe: ipcpSubscribe,
+      query: ipcpQuery,
+      close: ipcpClose,
+    })),
+  };
+});
+
+const ipccSubscribe = jest.fn();
+const ipccQuery = jest.fn();
+const ipccClose = jest.fn();
+
+jest.mock('../ipc-child', () => {
+  return {
+    IpcChildClient: jest.fn().mockImplementation((_opts) => ({
+      subscribe: ipccSubscribe,
+      query: ipccQuery,
+      close: ipccClose,
+    })),
+  };
+});
+
+const elrSubscribe = jest.fn();
+const elrQuery = jest.fn();
+const elrClose = jest.fn();
+
+jest.mock('../electron-ipc-renderer', () => {
+  return {
+    ElectronIpcRendererClient: jest.fn().mockImplementation((_opts) => ({
+      subscribe: elrSubscribe,
+      query: elrQuery,
+      close: elrClose,
+    })),
+  };
+});
+
+describe('Client (unit)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
   });
 
-  it('query pending -> resolves on QueryResponse via onRawEnvelope', async () => {
-    const t = new MockNodeTransport();
-    const client = new Client({ transport: t as unknown as Transport });
+  it('http: subscribe delegates to HttpClient.subscribe and returns unsubscribe fn', () => {
+    const unsubscribe = jest.fn();
+    httpSubscribe.mockReturnValueOnce(unsubscribe);
 
-    const rid = 'r-123';
-    const promise = client.query<{ x: number }, { ok: true }>(rid, { constructorName: 'GetX', dto: { x: 5 } }, 200);
+    const c = new Client({
+      transport: {
+        type: 'http',
+        inbound: { webhookUrl: 'http://x/events' },
+        query: { baseUrl: 'http://app' },
+      },
+    });
 
-    // Simulate app sending QueryResponse back via envHandler
-    const responsePayload: QueryResponsePayload<{ ok: true }> = { ok: true, data: { ok: true } };
-    t.envHandler!(
-      { action: Actions.QueryResponse, requestId: rid, payload: responsePayload },
-      { transport: 'ws' }
-    );
+    const off = c.subscribe('UserCreated', () => {});
+    expect(httpSubscribe).toHaveBeenCalledTimes(1);
+    expect(httpSubscribe).toHaveBeenCalledWith('UserCreated', expect.any(Function));
 
-    const res = await promise;
-    expect(res).toEqual({ ok: true });
-
-    // Sent queries captured
-    expect(t.sentQueries).toHaveLength(1);
-    expect(t.sentQueries[0]?.action).toBe(Actions.QueryRequest);
+    off();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 
-  it('query inline response path', async () => {
-    class InlineTransport extends MockNodeTransport {
-      async query<TReq, TRes>(requestId: string, _body: QueryRequestPayload<TReq>): Promise<TRes> {
-        // return inline result -> client should not wait for onRawEnvelope
-        return { ok: 1 } as unknown as TRes;
-      }
-    }
-    const t = new InlineTransport();
-    const client = new Client({ transport: t as unknown as Transport });
+  it('http: query delegates to HttpClient.query(name,dto) and returns result', async () => {
+    httpQuery.mockResolvedValueOnce({ ok: true, via: 'http' });
 
-    const res = await client.query('rid', { constructorName: 'Inline' }, 200);
-    expect(res).toEqual({ ok: 1 });
+    const c = new Client({
+      transport: {
+        type: 'http',
+        inbound: { webhookUrl: 'http://x/events' },
+        query: { baseUrl: 'http://app' },
+      },
+    });
+
+    const res = await c.query('SomeQuery', { a: 1 });
+    expect(httpQuery).toHaveBeenCalledTimes(1);
+    expect(httpQuery).toHaveBeenCalledWith({ name: 'SomeQuery', dto: { a: 1 } });
+    expect(res).toEqual({ ok: true, via: 'http' });
+  });
+
+  it('http: nodeHttpHandler() returns handler from HttpClient', () => {
+    const c = new Client({
+      transport: {
+        type: 'http',
+        inbound: { webhookUrl: 'http://x/events' },
+        query: { baseUrl: 'http://app' },
+      },
+    });
+    const handler = c.nodeHttpHandler();
+    expect(handler).toBe(httpNodeHandler);
+  });
+
+  it('close() calls underlying close() of the active transport', async () => {
+    const cHttp = new Client({
+      transport: {
+        type: 'http',
+        inbound: { webhookUrl: 'http://x/events' },
+        query: { baseUrl: 'http://app' },
+      },
+    });
+    await cHttp.close();
+    expect(httpClose).toHaveBeenCalledTimes(1);
+
+    const cWs = new Client({ transport: { type: 'ws', options: {} as any } });
+    await cWs.close();
+    expect(wsClose).toHaveBeenCalledTimes(1);
+
+    const cP = new Client({ transport: { type: 'ipc-parent', options: {} as any } });
+    await cP.close();
+    expect(ipcpClose).toHaveBeenCalledTimes(1);
+
+    const cC = new Client({ transport: { type: 'ipc-child', options: {} as any } });
+    await cC.close();
+    expect(ipccClose).toHaveBeenCalledTimes(1);
+
+    const cEl = new Client({ transport: { type: 'electron-ipc-renderer', options: {} as any } });
+    await cEl.close();
+    expect(elrClose).toHaveBeenCalledTimes(1);
   });
 });

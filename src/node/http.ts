@@ -21,6 +21,8 @@ export type HttpInboundOptions = {
   pongPassword?: string;
   /** Maximum allowed wire size in bytes. Default: 1 MiB. */
   maxWireBytes?: number;
+  /** Processing timeout for a batch before replying. Default: 3000 ms. */
+  processTimeoutMs?: number;
 };
 
 export type HttpQueryOptions = {
@@ -34,19 +36,14 @@ export type SubscribeHandler<T = any> = (evt: T) => unknown | Promise<unknown>;
  * HttpClient
  * -----------------------------------------------------------------------------
  * Role:
- * - Does not start its own server. Instead, provides:
- *   * `nodeHttpHandler` — a Node http/https request listener.
- *   * `expressRouter()` — an Express Router with exact paths from options.
+ * - Provides `nodeHttpHandler` and `expressRouter()` for inbound HTTP.
  * - Responds to pings with Pong (optionally including password).
- * - Accepts Outbox batches, fans them out to subscribers by `eventType`,
- *   then replies synchronously with ACK (`{ ok: true, okIndices }`).
- * - Sends queries to `${baseUrl}/query` as `{ name, data }` and expects
- *   `{ ok, data?, err? }` like your HttpTransportService.
- *
- * Notes:
- * - Token check (if configured): `x-transport-token`.
- * - ACK is synchronous in HTTP (returned as the response body).
- * - No timers/sockets are owned, so `close()` is a no-op.
+ * - Accepts Outbox batches and processes them with type-level sequencing:
+ *   * Exactly one subscriber per event type (duplicate subscription → error).
+ *   * Events of the same type are processed **sequentially** in arrival order.
+ *   * Different types are processed **in parallel**.
+ *   * Types without a subscriber are ignored (no-op) and do not block ACK.
+ * - Replies with ACK only after all relevant handlers finish within `processTimeoutMs`.
  */
 export class HttpClient {
   private readonly webhook: URL;
@@ -54,10 +51,11 @@ export class HttpClient {
   private readonly token?: string;
   private readonly pongPassword?: string;
   private readonly maxBytes: number;
-
+  private readonly processTimeoutMs: number;
   private readonly queryBase: string;
 
-  private subs = new Map<string, Set<SubscribeHandler>>();
+  // One handler per event type
+  private subs = new Map<string, SubscribeHandler>();
 
   constructor(inbound: HttpInboundOptions, query: HttpQueryOptions) {
     if (!query?.baseUrl) throw new Error('[client-http] query.baseUrl is required');
@@ -67,38 +65,23 @@ export class HttpClient {
     this.token = inbound.token;
     this.pongPassword = inbound.pongPassword;
     this.maxBytes = inbound.maxWireBytes ?? 1024 * 1024;
+    this.processTimeoutMs = Math.max(1, inbound.processTimeoutMs ?? 3000);
 
-    // pingPath: either provided via pingUrl or default to '/ping'
     this.pingPath = (inbound.pingUrl ? new URL(inbound.pingUrl).pathname : '/ping').replace(/\/+$/, '') || '/ping';
-
     this.queryBase = query.baseUrl.replace(/\/+$/, '');
-
-    // prevent accidental overlap with webhook path
-    const hookPath = (this.webhook.pathname || '/events').replace(/\/+$/, '') || '/events';
-    if (this.pingPath === hookPath) {
-      throw new Error('[client-http] pingPath must differ from webhook path');
-    }
   }
 
-  // ---- subscriptions ----
-  subscribe<T = any>(constructorName: string, handler: SubscribeHandler<T>): () => void {
-    const set = this.subs.get(constructorName) ?? new Set();
-    set.add(handler as any);
-    this.subs.set(constructorName, set);
-    return () => set.delete(handler as any);
-  }
-  getSubscriptionCount(constructorName: string): number {
-    return this.subs.get(constructorName)?.size ?? 0;
-  }
-  private async dispatchBatch(batch: OutboxStreamBatchPayload) {
-    const events = batch.events ?? [];
-    for (const wire of events) {
-      const name = wire.eventType;
-      const set = this.subs.get(name);
-      if (!set?.size) continue;
-      const evt = createDomainEventFromWire(wire);
-      for (const h of set) await h(evt);
+  /** Subscribe a handler to a specific DomainEvent constructor name. */
+  subscribe<T = any>(eventType: string, handler: SubscribeHandler<T>) {
+    if (this.subs.has(eventType)) {
+      throw new Error(`[client-http] duplicate subscription for type "${eventType}"`);
     }
+    this.subs.set(eventType, handler as SubscribeHandler);
+    return () => {
+      // Unsubscribe only if the same handler is still attached
+      const current = this.subs.get(eventType);
+      if (current === handler) this.subs.delete(eventType);
+    };
   }
 
   // ---- query out ----
@@ -126,38 +109,26 @@ export class HttpClient {
   }
 
   // --- Node HTTP/HTTPS request handler ----------------------------------------
-  // Passive inbox with two POST routes only:
-  //   • POST {hookPath} – strictly accepts OutboxStreamBatch and replies with ACK.
-  //   • POST {pingPath} – always returns Pong (optionally with { password }).
-  //
-  // Notes:
-  // - No GET handlers; any non-POST or unknown path → 404.
-  // - Token guard (x-transport-token) applies to both routes when configured.
-  // - 400 for invalid JSON/payload; 422 for well-formed envelope with wrong action.
   nodeHttpHandler = async (req: IncomingMessage, res: ServerResponse) => {
     try {
-      // Optional shared-secret guard
       if (this.token) {
         const got = String(req.headers['x-transport-token'] ?? '');
         if (got !== this.token) return this.replyText(res, 401, 'unauthorized');
       }
 
-      // Normalize paths
-      const pathname = (req.url?.split('?')[0] || '/').replace(/\/+$/, '');
+      const pathname = safePathname(req.url);
       const hookPath = (this.webhook.pathname || '/').replace(/\/+$/, '') || '/';
       const pingPath = this.pingPath ?? '/ping';
 
-      // 1) POST {pingPath} → Pong
       if (req.method === 'POST' && pathname === pingPath) {
         const pong: Message = {
           action: Actions.Pong,
-          payload: this.pongPassword ? { password: this.pongPassword } : undefined,
           timestamp: Date.now(),
+          payload: this.pongPassword ? { password: this.pongPassword } : undefined,
         };
         return this.replyJson(res, 200, pong);
       }
 
-      // 2) POST {hookPath} → strictly OutboxStreamBatch
       if (req.method === 'POST' && pathname === hookPath) {
         const body = await readBodyBounded(req, this.maxBytes - TRANSPORT_OVERHEAD_WIRE);
         if (!body.ok) return this.replyText(res, body.errCode!, body.errText!);
@@ -175,7 +146,7 @@ export class HttpClient {
         const p = msg.payload as OutboxStreamBatchPayload;
         if (!p || !Array.isArray(p.events)) return this.replyText(res, 400, 'invalid payload');
 
-        await this.dispatchBatch(p);
+        await this.processBatchWithTimeout(p);
 
         const ack: Message<OutboxStreamAckPayload> = {
           action: Actions.OutboxStreamAck,
@@ -185,7 +156,6 @@ export class HttpClient {
         return this.replyJson(res, 200, ack);
       }
 
-      // 3) Everything else → 404
       return this.replyText(res, 404, 'not found');
     } catch (e: any) {
       return this.replyText(res, 500, String(e?.message ?? e ?? 'internal error'));
@@ -193,19 +163,12 @@ export class HttpClient {
   };
 
   // --- Express Router factory --------------------------------------------------
-  // Exposes the same POST-only inbox:
-  //   • POST {hookPath} – strictly OutboxStreamBatch → ACK
-  //   • POST {pingPath} – always returns Pong
-  //
-  // Notes:
-  // - Token guard attached to both routes if configured.
   expressRouter() {
     const r = express.Router();
 
     const hookPath = (this.webhook.pathname || '/').replace(/\/+$/, '') || '/';
     const pingPath = this.pingPath ?? '/ping';
 
-    // Token guard for both inbox routes (if configured)
     if (this.token) {
       r.use([hookPath, pingPath], (req, res, next) => {
         const got = String(req.header('x-transport-token') ?? '');
@@ -214,27 +177,28 @@ export class HttpClient {
       });
     }
 
-    // POST {pingPath} → Pong
     r.post(pingPath, (_req, res) => {
-      const pong: Message<{ password?: string }> = {
+      const pong: Message = {
         action: Actions.Pong,
-        payload: this.pongPassword ? { password: this.pongPassword } : undefined,
         timestamp: Date.now(),
+        payload: this.pongPassword ? { password: this.pongPassword } : undefined,
       };
-      res.status(200).json(pong);
+      return res.status(200).json(pong);
     });
 
-    // POST {hookPath} → strictly OutboxStreamBatch
-    r.post(hookPath, express.json({ limit: '2mb' }), async (req, res) => {
+    r.post(hookPath, express.json({ limit: this.maxBytes }), async (req, res) => {
       const msg = req.body as Message;
-
       if (!msg || typeof msg.action !== 'string') return res.status(422).send('invalid message');
       if (msg.action !== Actions.OutboxStreamBatch) return res.status(422).send('invalid action');
 
       const p = msg.payload as OutboxStreamBatchPayload;
       if (!p || !Array.isArray(p.events)) return res.status(400).send('invalid payload');
 
-      await this.dispatchBatch(p);
+      try {
+        await this.processBatchWithTimeout(p);
+      } catch (e: any) {
+        return res.status(500).send(String(e?.message ?? e ?? 'internal error'));
+      }
 
       const ack: Message<OutboxStreamAckPayload> = {
         action: Actions.OutboxStreamAck,
@@ -251,6 +215,56 @@ export class HttpClient {
     // No owned resources to release.
   }
 
+  // ---- batch processing helpers ---------------------------------------------
+  /**
+   * Process a batch with a global timeout. If there are no relevant subscribers,
+   * completes immediately. Any failure or timeout rejects.
+   */
+  private async processBatchWithTimeout(batch: OutboxStreamBatchPayload): Promise<void> {
+    const work = this.dispatchBatch(batch);
+    await this.withTimeout(work, this.processTimeoutMs);
+  }
+
+  /**
+   * Route events by type with **sequential per-type processing** and
+   * **parallel across types**. Types without a subscriber are ignored.
+   */
+  async dispatchBatch(batch: OutboxStreamBatchPayload) {
+    const wires = batch.events ?? [];
+    if (!wires.length) return;
+
+    // 1) Build index lists per subscribed type (cheap routing, no object copies)
+    const perTypeIdx = new Map<string, number[]>();
+    for (let i = 0; i < wires.length; i++) {
+      const w = wires[i]!;
+      const handler = this.subs.get(w.eventType);
+      if (!handler) continue; // no-op types do not block
+      let arr = perTypeIdx.get(w.eventType);
+      if (!arr) perTypeIdx.set(w.eventType, (arr = []));
+      arr.push(i);
+    }
+
+    if (perTypeIdx.size === 0) return; // no relevant subscribers → immediate ACK
+
+    // 2) For each type create ONE task that processes its events sequentially
+    const tasks: Promise<void>[] = [];
+    for (const [type, idxs] of perTypeIdx) {
+      const handler = this.subs.get(type)!; // exists by construction
+      tasks.push(
+        (async () => {
+          for (let k = 0; k < idxs.length; k++) {
+            const wire = wires[idxs[k]!]!;
+            const evt = createDomainEventFromWire(wire);
+            await Promise.resolve().then(() => handler(evt)); // sequence preserved
+          }
+        })()
+      );
+    }
+
+    // 3) Await all types in parallel; any failure rejects the batch
+    await Promise.all(tasks);
+  }
+
   // ---- helpers ----
   private replyJson(res: ServerResponse, code: number, obj: unknown) {
     const s = JSON.stringify(obj);
@@ -261,21 +275,47 @@ export class HttpClient {
     res.writeHead(code, { 'Content-Type': 'text/plain', 'Content-Length': Buffer.byteLength(text) });
     res.end(text);
   }
+
+  private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('batch processing timeout')), ms);
+      p.then(
+        (v) => {
+          clearTimeout(t);
+          resolve(v);
+        },
+        (e) => {
+          clearTimeout(t);
+          reject(e);
+        }
+      );
+    });
+  }
 }
 
-async function safeReadText(res: Response) {
+// ---- tiny utils --------------------------------------------------------------
+function safePathname(u?: string | null) {
+  try {
+    return new URL(u ?? '/', 'http://local').pathname;
+  } catch {
+    return '/';
+  }
+}
+async function safeReadText(res: Response): Promise<string> {
   try {
     return await res.text();
   } catch {
     return '';
   }
 }
-function readBodyBounded(
+
+/** Read an entire request body with a hard cap on size. */
+async function readBodyBounded(
   req: IncomingMessage,
   limit: number
 ): Promise<{ ok: true; body: string } | { ok: false; errCode: number; errText: string }> {
+  let size = 0;
   return new Promise((resolve) => {
-    let size = 0;
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => {
       size += c.length;

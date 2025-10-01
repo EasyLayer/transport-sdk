@@ -57,25 +57,62 @@ export class IpcChildClient {
       payload: { name, dto },
     };
 
-    let resolveFn!: (v: any) => void;
-    const p = new Promise<TRes>((resolve) => (resolveFn = resolve));
-    this.pendingQueries.set(requestId, resolveFn);
+    let timer: any;
+    const p = new Promise<TRes>((resolve, reject) => {
+      timer = setTimeout(
+        () => {
+          this.pendingQueries.delete(requestId);
+          reject(new Error('ipc-child: query timeout'));
+        },
+        Math.max(1, timeoutMs)
+      );
 
+      this.pendingQueries.set(requestId, (payload: any) => {
+        clearTimeout(timer);
+        resolve(payload);
+      });
+    });
     (process as any).send?.(env);
-
-    const deadline = Date.now() + timeoutMs;
-    const backoff = { wait: 16 };
-
-    while (Date.now() < deadline) {
-      if (!this.pendingQueries.has(requestId)) return await p;
-      await delay(nextBackoff(backoff, { factor: 1.6, max: 300, jitter: 0.2 }));
-    }
-
-    this.pendingQueries.delete(requestId);
-    throw new Error('[client-ipc-child] query timeout');
+    return p;
   }
 
-  async close(): Promise<void> {
+  async sendBatch(events: OutboxStreamBatchPayload, timeoutMs = 3_000): Promise<OutboxStreamAckPayload> {
+    const requestId = uuid();
+    const env: Message<OutboxStreamBatchPayload> = {
+      action: Actions.OutboxStreamBatch,
+      requestId,
+      timestamp: Date.now(),
+      payload: events,
+    };
+
+    let timer: any;
+    return await new Promise<OutboxStreamAckPayload>((resolve, reject) => {
+      const handler = (raw: unknown) => {
+        const msg = normalize(raw);
+        if (!msg || msg.action !== Actions.OutboxStreamAck || msg.requestId !== requestId) return;
+        cleanup();
+        resolve(msg.payload as any as OutboxStreamAckPayload);
+      };
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        (process as any).off?.('message', handler);
+      };
+
+      (process as any).on?.('message', handler);
+      (process as any).send?.(env);
+
+      timer = setTimeout(
+        () => {
+          cleanup();
+          reject(new Error('ipc-child: ack timeout'));
+        },
+        Math.max(1, timeoutMs)
+      );
+    });
+  }
+
+  close() {
     (process as any).off?.('message', this.onMessageBound);
     this.pendingQueries.clear();
     this.subs.clear();
@@ -98,20 +135,24 @@ export class IpcChildClient {
       }
 
       case Actions.OutboxStreamBatch: {
-        const p = msg.payload as OutboxStreamBatchPayload;
-        if (!p || !Array.isArray(p.events)) return;
-
-        for (const w of p.events) {
-          const set = this.subs.get(w.eventType || 'UnknownEvent');
+        const events = (msg.payload as any)?.events ?? [];
+        for (const e of events) {
+          const evt = createDomainEventFromWire(e);
+          const set = this.subs.get(evt.constructor.name);
           if (!set?.size) continue;
-          const evt = createDomainEventFromWire(w);
-          for (const h of set) await h(evt);
+          for (const fn of set) {
+            try {
+              await fn(evt);
+            } catch {
+              // swallow user handler errors
+            }
+          }
         }
-
         const ack: Message<OutboxStreamAckPayload> = {
           action: Actions.OutboxStreamAck,
+          requestId: msg.requestId,
           timestamp: Date.now(),
-          payload: { ok: true, okIndices: p.events.map((_e, i) => i) },
+          payload: { ok: true },
         };
         (process as any).send?.(ack);
         return;

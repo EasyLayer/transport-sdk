@@ -1,5 +1,5 @@
 // Minimal setup for e2e tests
-import 'reflect-metadata';
+// import 'reflect-metadata';
 
 // Reduced timeout for faster tests
 jest.setTimeout(60000); // Reduced from 120000

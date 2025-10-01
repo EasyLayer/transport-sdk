@@ -1,5 +1,3 @@
-import type { QueryRequestPayload } from '../core';
-import { uuid } from '../core';
 import { HttpClient, type HttpInboundOptions, type HttpQueryOptions } from './http';
 import { WsClient } from './ws';
 import { IpcParentClient } from './ipc-parent';
@@ -111,20 +109,12 @@ export class Client {
     if (this.elr) return this.elr.subscribe<T>(constructorName, handler);
     throw new Error('[client] no transport');
   }
-  getSubscriptionCount(constructorName: string): number {
-    if (this.http) return this.http.getSubscriptionCount(constructorName);
-    if (this.ws) return this.ws.getSubscriptionCount(constructorName);
-    if (this.ipcp) return this.ipcp.getSubscriptionCount(constructorName);
-    if (this.ipcc) return this.ipcc.getSubscriptionCount(constructorName);
-    if (this.elr) return this.elr.getSubscriptionCount(constructorName);
-    return 0;
-  }
 
   // ---- query ----
   async query<TReq, TRes>(name: string, dto?: TReq, timeoutMs?: number): Promise<TRes> {
     let raw: any;
     if (this.http) raw = await this.http.query<TRes>({ name, dto });
-    else if (this.ws) raw = await this.ws.query<TRes>(uuid(), { name, dto } as QueryRequestPayload, timeoutMs ?? 5_000);
+    else if (this.ws) raw = await this.ws.query<TRes>({ name, dto });
     else if (this.ipcp) raw = await this.ipcp.query<TReq, TRes>(name, dto, timeoutMs ?? 5_000);
     else if (this.ipcc) raw = await this.ipcc.query<TReq, TRes>(name, dto, timeoutMs ?? 5_000);
     else if (this.elr) raw = await this.elr.query<TReq, TRes>(name, dto, timeoutMs ?? 5_000);
