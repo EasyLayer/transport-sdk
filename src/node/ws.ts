@@ -9,7 +9,7 @@ export type WsClientOptions = {
   token?: string; // sent in Sec-WebSocket-Protocol (first protocol)
   clientId?: string; // sent in Sec-WebSocket-Protocol (second protocol)
   pongPassword?: string; // included in Pong payload when replying to app-level Ping
-  maxWireBytes?: number; // default 1 MiB
+  maxWireBytes?: number; // default 10 MiB — must match server transportMaxFrameBytes
   processTimeoutMs?: number; // default 3000
   /**
    * Optional factory for creating WebSocket instances in managed mode.
@@ -53,7 +53,7 @@ export class WsClient {
     this.token = opts.token;
     this.clientId = opts.clientId;
     this.pongPassword = opts.pongPassword;
-    this.maxBytes = Math.max(1024, opts.maxWireBytes ?? 1024 * 1024);
+    this.maxBytes = Math.max(1024, opts.maxWireBytes ?? 10 * 1024 * 1024);
     this.processTimeoutMs = Math.max(1, opts.processTimeoutMs ?? 3000);
     this.socketFactory = opts.socketFactory;
   }
@@ -255,6 +255,11 @@ export class WsClient {
 
   // ---- helpers --------------------------------------------------------------
   private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+    // NOTE: when the timeout fires, the outer promise is rejected
+    // and no ACK is sent (server will retry). However, the underlying dispatchBatch promise
+    // continues running in the background. If handlers complete after the timeout, their
+    // side-effects have already happened but the batch will be re-delivered on retry.
+    // Handlers MUST be idempotent to tolerate this at-least-once delivery guarantee.
     return new Promise<T>((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('batch processing timeout')), ms);
       p.then(
