@@ -1,3 +1,11 @@
+## 1.3.0 (2026-03-23)
+
+* fix: fixed yarn lock file; ([bb48284](https://github.com/easylayer/transport-sdk/commit/bb48284))
+* BREAKING: setup correct browser version; ([5dd9e85](https://github.com/easylayer/transport-sdk/commit/5dd9e85))
+* refactor: added shared worker client; fixed electron ipc renderer; updated message limit size; ([6c4d3cb](https://github.com/easylayer/transport-sdk/commit/6c4d3cb))
+
+
+
 ## 1.2.0 (2025-10-01)
 
 * chore: updated docs; ([b029f7e](https://github.com/easylayer/transport-sdk/commit/b029f7e))

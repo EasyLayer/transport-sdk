@@ -62,7 +62,7 @@ export class HttpClient {
     this.webhook = new URL(inbound.webhookUrl);
     this.token = inbound.token;
     this.pongPassword = inbound.pongPassword;
-    this.maxBytes = inbound.maxWireBytes ?? 1024 * 1024;
+    this.maxBytes = inbound.maxWireBytes ?? 10 * 1024 * 1024;
     this.processTimeoutMs = Math.max(1, inbound.processTimeoutMs ?? 3000);
 
     this.pingPath = (inbound.pingUrl ? new URL(inbound.pingUrl).pathname : '/ping').replace(/\/+$/, '') || '/ping';

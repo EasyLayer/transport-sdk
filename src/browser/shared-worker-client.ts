@@ -7,58 +7,81 @@ import type {
 } from '../core';
 import { Actions, createDomainEventFromWire, uuid, nextBackoff, delay } from '../core';
 
+export type SharedWorkerClientOptions = {
+  /** URL of the SharedWorker script (compiled bundle). */
+  url: string;
+  /** Optional password — must match SharedWorkerServer pongPassword. */
+  pongPassword?: string;
+  /** Query timeout in ms. Default: 10_000. */
+  queryTimeoutMs?: number;
+};
+
 /**
- * ElectronRendererTransport (browser-side in renderer)
+ * SharedWorkerClient
  * -----------------------------------------------------------------------------
- * Role:
- * - Runs in Electron renderer and talks to main via 'transport:message'.
- * - Accepts 'ping' -> replies 'pong' (with optional { password }).
- * - Accepts 'outbox.stream.batch' -> fan-out -> replies 'outbox.stream.ack'.
- * - Sends 'query.request' -> awaits 'query.response' from main's ElectronIpcMainService.
+ * Runs in a browser window/tab. Connects to a SharedWorker and provides:
+ *   - subscribe(eventName, handler)  — receive domain events pushed by the worker
+ *   - query(name, dto)               — request/response query to the worker's QueryBus
+ *   - tapRaw / onAction              — low-level message hooks
  *
- * Extensibility:
- * - tapRaw(handler): observe every envelope before routing.
- * - onAction(action, handler): react to custom actions.
+ * The SharedWorker must run SharedWorkerServer and wire:
+ *   self.onconnect = (e) => server.addPort(e.ports[0]);
+ *
+ * Usage in window:
+ *
+ *   const client = new SharedWorkerClient({ url: '/worker.js' });
+ *   const balance = await client.query('GetBalanceQuery', { addresses: ['1A1z...'] });
+ *   client.subscribe('BasicWalletDelta', (evt) => console.log(evt));
  */
-export class ElectronRendererTransport {
-  private readonly ipc: IpcRendererLike;
-  private readonly pongPassword?: string;
+export class SharedWorkerClient {
+  private readonly worker: SharedWorker;
+  private readonly port: MessagePort;
+  private readonly opts: SharedWorkerClientOptions;
+
+  private online = false;
+  private lastPongAt = 0;
 
   private subs = new Map<string, Set<(evt: any) => unknown | Promise<unknown>>>();
   private pendingQueries = new Map<string, (payload: any) => void>();
   private rawHandlers = new Set<(m: Message) => void>();
   private actionHandlers = new Map<string, Set<(m: Message) => void>>();
 
-  private readonly onIpc = (_: any, raw: unknown) => this.handleIncoming(raw);
+  constructor(opts: SharedWorkerClientOptions) {
+    if (!opts?.url) throw new Error('[shared-worker-client] url is required');
+    this.opts = opts;
 
-  constructor(opts?: { ipcRenderer?: IpcRendererLike; pongPassword?: string }) {
-    this.ipc = opts?.ipcRenderer ?? getIpcRenderer();
-    this.pongPassword = opts?.pongPassword;
+    this.worker = new SharedWorker(opts.url, { type: 'module' });
+    this.port = this.worker.port;
 
-    this.ipc.on('transport:message', this.onIpc);
+    this.port.onmessage = (ev) => this.handleIncoming(ev.data);
+    this.port.onmessageerror = () => {
+      /* port error */
+    };
+    this.port.start();
   }
 
   // ---------------------------------------------------------------------------
-  // Subscriptions
+  // Subscriptions — receive events pushed from the worker
   // ---------------------------------------------------------------------------
 
-  subscribe<T = any>(constructorName: string, handler: (evt: T) => unknown | Promise<unknown>): () => void {
-    const set = this.subs.get(constructorName) ?? new Set();
+  subscribe<T = any>(eventName: string, handler: (evt: T) => unknown | Promise<unknown>): () => void {
+    const set = this.subs.get(eventName) ?? new Set();
     set.add(handler as any);
-    this.subs.set(constructorName, set);
+    this.subs.set(eventName, set);
     return () => set.delete(handler as any);
   }
 
-  getSubscriptionCount(constructorName: string): number {
-    return this.subs.get(constructorName)?.size ?? 0;
+  getSubscriptionCount(eventName: string): number {
+    return this.subs.get(eventName)?.size ?? 0;
   }
 
   // ---------------------------------------------------------------------------
-  // Query — renderer → main (ElectronIpcMainService routes to QueryBus)
+  // Query — send query.request, await query.response
   // ---------------------------------------------------------------------------
 
-  async query<TReq = unknown, TRes = unknown>(name: string, dto?: TReq, timeoutMs = 10_000): Promise<TRes> {
+  async query<TReq = unknown, TRes = unknown>(name: string, dto?: TReq, timeoutMs?: number): Promise<TRes> {
     const requestId = uuid();
+    const timeout = timeoutMs ?? this.opts.queryTimeoutMs ?? 10_000;
 
     const req: Message<QueryRequestPayload> = {
       action: Actions.QueryRequest,
@@ -71,10 +94,10 @@ export class ElectronRendererTransport {
     const p = new Promise<TRes>((resolve) => (resolveFn = resolve));
     this.pendingQueries.set(requestId, resolveFn);
 
-    this.ipc.send('transport:message', req);
+    this.send(req);
 
     // Poll with exponential backoff until response arrives or timeout
-    const deadline = Date.now() + timeoutMs;
+    const deadline = Date.now() + timeout;
     const backoff = { wait: 16 };
 
     while (Date.now() < deadline) {
@@ -83,7 +106,7 @@ export class ElectronRendererTransport {
     }
 
     this.pendingQueries.delete(requestId);
-    throw new Error(`[electron-renderer] query "${name}" timed out after ${timeoutMs}ms`);
+    throw new Error(`[shared-worker-client] query "${name}" timed out after ${timeout}ms`);
   }
 
   // ---------------------------------------------------------------------------
@@ -102,12 +125,18 @@ export class ElectronRendererTransport {
     return () => set.delete(handler);
   }
 
-  // ---------------------------------------------------------------------------
-  // Lifecycle
-  // ---------------------------------------------------------------------------
+  /** Whether the worker has replied to a ping recently. */
+  isOnline(): boolean {
+    return this.online && Date.now() - this.lastPongAt < 15_000;
+  }
+
+  /** Send a ping to check liveness. */
+  ping(): void {
+    this.send({ action: Actions.Ping, requestId: uuid(), timestamp: Date.now() });
+  }
 
   async close(): Promise<void> {
-    this.ipc.off('transport:message', this.onIpc);
+    this.port.close();
     this.subs.clear();
     this.pendingQueries.clear();
     this.rawHandlers.clear();
@@ -115,19 +144,22 @@ export class ElectronRendererTransport {
   }
 
   // ---------------------------------------------------------------------------
-  // Routing
+  // Internal
   // ---------------------------------------------------------------------------
 
   /* eslint-disable no-empty */
-  private async handleIncoming(raw: unknown) {
+  private async handleIncoming(raw: unknown): Promise<void> {
     const msg = normalize(raw);
     if (!msg?.action) return;
 
+    // Raw tap
     for (const h of this.rawHandlers) {
       try {
         h(msg);
       } catch {}
     }
+
+    // Action hooks
     const ah = this.actionHandlers.get(msg.action);
     if (ah?.size) {
       for (const h of ah) {
@@ -138,17 +170,18 @@ export class ElectronRendererTransport {
     }
 
     switch (msg.action) {
-      case Actions.Ping: {
-        const pong: Message<{ password?: string }> = {
-          action: Actions.Pong,
-          payload: this.pongPassword ? { password: this.pongPassword } : undefined,
-          timestamp: Date.now(),
-        };
-        this.ipc.send('transport:message', pong);
+      case Actions.Pong: {
+        const pw = (msg.payload as any)?.password;
+        const ok = this.opts.pongPassword ? pw === this.opts.pongPassword : true;
+        if (ok) {
+          this.lastPongAt = Date.now();
+          this.online = true;
+        }
         return;
       }
 
       case Actions.OutboxStreamBatch: {
+        // Worker pushed an event batch — fan out to subscribers
         const p = msg.payload as OutboxStreamBatchPayload;
         if (!p || !Array.isArray(p.events)) return;
 
@@ -159,12 +192,14 @@ export class ElectronRendererTransport {
           for (const h of set) await h(evt);
         }
 
+        // Reply with ACK so worker can advance outbox cursor if configured
         const ack: Message<OutboxStreamAckPayload> = {
           action: Actions.OutboxStreamAck,
+          requestId: msg.requestId,
           timestamp: Date.now(),
           payload: { ok: true, okIndices: p.events.map((_e, i) => i) },
         };
-        this.ipc.send('transport:message', ack);
+        this.send(ack);
         return;
       }
 
@@ -185,23 +220,15 @@ export class ElectronRendererTransport {
     }
   }
   /* eslint-enable no-empty */
+
+  private send(msg: Message): void {
+    this.port.postMessage(JSON.stringify(msg));
+  }
 }
 
 // -----------------------------------------------------------------------------
-// IPC types + helpers
+// Helper
 // -----------------------------------------------------------------------------
-
-type IpcRendererLike = {
-  on(channel: string, listener: (...args: any[]) => void): void;
-  off(channel: string, listener: (...args: any[]) => void): void;
-  send(channel: string, ...args: any[]): void;
-};
-
-function getIpcRenderer(): IpcRendererLike {
-  const maybe = (globalThis as any)?.electron?.ipcRenderer ?? (globalThis as any)?.ipcRenderer;
-  if (!maybe) throw new Error('[electron-renderer] ipcRenderer not available; pass via opts.ipcRenderer');
-  return maybe;
-}
 
 function normalize(raw: unknown): Message | null {
   if (!raw) return null;

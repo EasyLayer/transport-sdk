@@ -1,6 +1,8 @@
-import { Buffer } from 'buffer';
+// No longer importing Buffer from 'buffer' — all Buffer usage replaced with
+// environment-safe alternatives so this file works in Node, browser, and Electron
+// renderer without any polyfill requirement.
 
-export type TransportKind = 'http' | 'ws' | 'ipc-parent' | 'ipc-child' | 'electron-ipc-renderer';
+export type TransportKind = 'http' | 'ws' | 'ipc-parent' | 'ipc-child' | 'electron-ipc-renderer' | 'shared-worker';
 
 export const Actions = {
   Ping: 'ping',
@@ -32,7 +34,7 @@ export type WireEventRecord = {
   blockHeight: number | null;
   /** Serialized JSON string */
   payload: string;
-  /** Milliseconds since epoch */
+  /** Microseconds since epoch (monotonic, from DomainEvent.timestamp). */
   timestamp: number;
 };
 
@@ -90,8 +92,28 @@ export function safeParse(s: unknown) {
 
 /** Must be kept in sync with the server (256). */
 export const TRANSPORT_OVERHEAD_WIRE = 256;
-/** UTF-8 byte length helper. */
-export const utf8Len = (s: string) => Buffer.byteLength(s, 'utf8');
+
+/**
+ * UTF-8 byte length of a string — works in Node, browser, and Electron renderer.
+ *
+ * Node:    uses Buffer.byteLength (fast, built-in).
+ * Browser: uses TextEncoder (standard Web API, no polyfill needed).
+ *
+ * The npm 'buffer' polyfill is NOT imported here; each environment uses its
+ * own native API so the shared core stays truly portable.
+ */
+export function utf8Len(s: string): number {
+  // Node / Electron main: Buffer is available natively
+  if (typeof Buffer !== 'undefined' && typeof Buffer.byteLength === 'function') {
+    return Buffer.byteLength(s, 'utf8');
+  }
+  // Browser / Electron renderer: TextEncoder is a standard Web API (no polyfill)
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(s).byteLength;
+  }
+  // Fallback: approximate via escaped unicode (never reached in modern runtimes)
+  return encodeURIComponent(s).replace(/%[0-9A-F]{2}/gi, '_').length;
+}
 
 export function uuid(): string {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
@@ -105,8 +127,18 @@ export function delay(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * Deserialize a raw incoming message into a typed Message envelope.
+ * Handles string (JSON), Node Buffer, ArrayBuffer (browser binary WS frames),
+ * and plain objects.
+ *
+ * Buffer.isBuffer() is replaced with an explicit prototype check so this
+ * function is safe in the browser where the npm 'buffer' polyfill's isBuffer()
+ * always returns false for native Uint8Arrays.
+ */
 export function normalize(raw: unknown): Message | null {
   if (!raw) return null;
+
   if (typeof raw === 'string') {
     try {
       return JSON.parse(raw) as Message;
@@ -114,13 +146,30 @@ export function normalize(raw: unknown): Message | null {
       return null;
     }
   }
-  if (Buffer.isBuffer(raw)) {
+
+  // Node Buffer or browser Uint8Array/Buffer-polyfill — decode as UTF-8 string
+  if (raw instanceof Uint8Array) {
     try {
-      return JSON.parse(raw.toString('utf8')) as Message;
+      const text =
+        typeof TextDecoder !== 'undefined'
+          ? new TextDecoder().decode(raw)
+          : // Node: Uint8Array (Buffer) has toString()
+            (raw as any).toString('utf8');
+      return JSON.parse(text) as Message;
     } catch {
       return null;
     }
   }
+
+  // Browser binary WebSocket frame delivered as ArrayBuffer
+  if (typeof ArrayBuffer !== 'undefined' && raw instanceof ArrayBuffer) {
+    try {
+      return JSON.parse(new TextDecoder().decode(raw)) as Message;
+    } catch {
+      return null;
+    }
+  }
+
   if (typeof raw === 'object') return raw as Message;
   return null;
 }
