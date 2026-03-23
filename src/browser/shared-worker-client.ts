@@ -50,7 +50,7 @@ export class SharedWorkerClient {
     if (!opts?.url) throw new Error('[shared-worker-client] url is required');
     this.opts = opts;
 
-    this.worker = new SharedWorker(opts.url);
+    this.worker = new SharedWorker(opts.url, { type: 'module' });
     this.port = this.worker.port;
 
     this.port.onmessage = (ev) => this.handleIncoming(ev.data);

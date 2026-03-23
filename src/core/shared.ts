@@ -2,7 +2,7 @@
 // environment-safe alternatives so this file works in Node, browser, and Electron
 // renderer without any polyfill requirement.
 
-export type TransportKind = 'http' | 'ws' | 'ipc-parent' | 'ipc-child' | 'electron-ipc-renderer';
+export type TransportKind = 'http' | 'ws' | 'ipc-parent' | 'ipc-child' | 'electron-ipc-renderer' | 'shared-worker';
 
 export const Actions = {
   Ping: 'ping',

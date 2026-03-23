@@ -198,15 +198,9 @@ type IpcRendererLike = {
 };
 
 function getIpcRenderer(): IpcRendererLike {
-  try {
-    const { ipcRenderer } = require('electron');
-    if (!ipcRenderer) throw new Error();
-    return ipcRenderer as IpcRendererLike;
-  } catch {
-    const maybe = (globalThis as any)?.electron?.ipcRenderer ?? (globalThis as any)?.ipcRenderer;
-    if (!maybe) throw new Error('[electron-renderer] ipcRenderer not available; pass via opts.ipcRenderer');
-    return maybe as IpcRendererLike;
-  }
+  const maybe = (globalThis as any)?.electron?.ipcRenderer ?? (globalThis as any)?.ipcRenderer;
+  if (!maybe) throw new Error('[electron-renderer] ipcRenderer not available; pass via opts.ipcRenderer');
+  return maybe;
 }
 
 function normalize(raw: unknown): Message | null {

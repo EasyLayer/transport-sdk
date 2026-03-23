@@ -10,11 +10,6 @@ import type { SharedWorkerClientOptions } from './shared-worker-client';
  *   - ws                    — WebSocket to a server
  *   - electron-ipc-renderer — renderer talks to Electron main
  *   - shared-worker         — window talks to a SharedWorker running the crawler
- *
- * All three share the same API:
- *   client.subscribe(eventName, handler)
- *   client.query(name, dto)
- *   client.close()
  */
 export class Client {
   private ws?: WsBrowserClient;
@@ -47,10 +42,6 @@ export class Client {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Subscriptions
-  // ---------------------------------------------------------------------------
-
   subscribe<T = any>(name: string, handler: (evt: T) => unknown | Promise<unknown>): () => void {
     if (this.ws) return this.ws.subscribe<T>(name, handler);
     if (this.el) return this.el.subscribe<T>(name, handler);
@@ -65,10 +56,6 @@ export class Client {
     return 0;
   }
 
-  // ---------------------------------------------------------------------------
-  // Query — only shared-worker and electron-ipc-renderer support this
-  // ---------------------------------------------------------------------------
-
   async query<TReq = unknown, TRes = unknown>(name: string, dto?: TReq, timeoutMs?: number): Promise<TRes> {
     if (this.sw) return this.sw.query<TReq, TRes>(name, dto, timeoutMs);
     if (this.el) return this.el.query<TReq, TRes>(name, dto, timeoutMs);
@@ -77,9 +64,19 @@ export class Client {
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // Extensibility
-  // ---------------------------------------------------------------------------
+  /** Send a ping to check SharedWorker liveness. No-op for other transports. */
+  ping(): void {
+    if (this.sw) return this.sw.ping();
+  }
+
+  /**
+   * Whether the SharedWorker has replied to a ping recently.
+   * For ws/electron-ipc-renderer returns true once constructed.
+   */
+  isOnline(): boolean {
+    if (this.sw) return this.sw.isOnline();
+    return !!(this.ws || this.el);
+  }
 
   tapRaw(handler: (msg: any) => void): () => void {
     if (this.ws) return this.ws.tapRaw(handler);
