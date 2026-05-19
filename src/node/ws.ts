@@ -184,12 +184,17 @@ export class WsClient {
       }
       case Actions.OutboxStreamBatch: {
         const p = msg.payload as OutboxStreamBatchPayload;
+        const correlationId = msg.correlationId;
+        if (!correlationId) break;
+
         try {
           await this.processBatchWithTimeout(p);
+          const okIndices = p.events.map((_e, i) => i);
           const ack: Message<OutboxStreamAckPayload> = {
             action: Actions.OutboxStreamAck,
+            correlationId,
             timestamp: Date.now(),
-            payload: { ok: true, okIndices: p.events.map((_e, i) => i) },
+            payload: { ok: true, okIndices, correlationId },
           } as any;
           this.ws?.send(JSON.stringify(ack));
         } catch {

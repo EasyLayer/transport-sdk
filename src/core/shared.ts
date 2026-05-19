@@ -39,7 +39,7 @@ export type WireEventRecord = {
 };
 
 export type OutboxStreamBatchPayload = { events: WireEventRecord[] };
-export type OutboxStreamAckPayload = { ok: boolean; okIndices?: number[] };
+export type OutboxStreamAckPayload = { ok: boolean; okIndices?: number[]; correlationId?: string; err?: string };
 
 export type QueryRequestPayload = { name: string; dto?: unknown };
 export type QueryResponsePayload = { ok: boolean; name?: string; data?: any; err?: string };

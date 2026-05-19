@@ -62,6 +62,8 @@ describe('HttpClient E2E', () => {
     expect(res.ok).toBe(true);
     const ack = await res.json();
     expect(ack.action).toBe(Actions.OutboxStreamAck);
+    expect(ack.correlationId).toBe('c1');
+    expect(ack.payload?.correlationId).toBe('c1');
 
     await waitFor(() => seen.length === 2);
     expect(seen).toEqual([0, 1]);

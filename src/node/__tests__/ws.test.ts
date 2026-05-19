@@ -99,6 +99,7 @@ describe('WsClient', () => {
 
     const batch: Message<OutboxStreamBatchPayload> = {
       action: Actions.OutboxStreamBatch,
+      correlationId: 'batch-1',
       timestamp: Date.now(),
       payload: { events: wires },
     };
@@ -111,9 +112,35 @@ describe('WsClient', () => {
     const ackRaw = sock.sent.find((s) => JSON.parse(s).action === Actions.OutboxStreamAck);
     expect(ackRaw).toBeTruthy();
     const ack = JSON.parse(ackRaw!);
+    expect(ack.correlationId).toBe('batch-1');
+    expect(ack.payload?.correlationId).toBe('batch-1');
     expect(ack.payload?.ok).toBe(true);
     expect(Array.isArray(ack.payload?.okIndices)).toBe(true);
     expect(ack.payload.okIndices.length).toBe(wires.length);
+  });
+
+
+  it('OutboxStreamBatch: missing correlationId → NO ACK and no dispatch', async () => {
+    const { client, sock } = makeClientWithFakeSocket();
+    const p = client.connect();
+    sock.openNow();
+    await p;
+
+    const handler = jest.fn();
+    client.subscribe('A', handler);
+
+    const batch: Message<OutboxStreamBatchPayload> = {
+      action: Actions.OutboxStreamBatch,
+      timestamp: Date.now(),
+      payload: { events: [{ eventType: 'A', payload: { id: 'A1' } } as any] },
+    };
+
+    sock.emitMessage(batch);
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(handler).not.toHaveBeenCalled();
+    const ackRaw = sock.sent.find((s) => JSON.parse(s).action === Actions.OutboxStreamAck);
+    expect(ackRaw).toBeUndefined();
   });
 
   it('OutboxStreamBatch: timeout → NO ACK', async () => {
@@ -129,6 +156,7 @@ describe('WsClient', () => {
 
     const batch: Message<OutboxStreamBatchPayload> = {
       action: Actions.OutboxStreamBatch,
+      correlationId: 'slow-batch',
       timestamp: Date.now(),
       payload: { events: [{ eventType: 'SLOW', payload: {} } as any] },
     };

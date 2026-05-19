@@ -167,7 +167,8 @@ export class WsBrowserClient {
 
       case Actions.OutboxStreamBatch: {
         const p = msg.payload as OutboxStreamBatchPayload;
-        if (!p || !Array.isArray(p.events)) return;
+        const correlationId = msg.correlationId;
+        if (!correlationId || !p || !Array.isArray(p.events)) return;
 
         for (const wire of p.events) {
           const set = this.subs.get(wire.eventType || 'UnknownEvent');
@@ -176,10 +177,12 @@ export class WsBrowserClient {
           for (const h of set) await h(evt);
         }
 
+        const okIndices = p.events.map((_e, i) => i);
         const ack: Message<OutboxStreamAckPayload> = {
           action: Actions.OutboxStreamAck,
+          correlationId,
           timestamp: Date.now(),
-          payload: { ok: true, okIndices: p.events.map((_e, i) => i) },
+          payload: { ok: true, okIndices, correlationId },
         };
         this.send(ack);
         return;

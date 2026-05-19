@@ -1,3 +1,9 @@
+## <small>1.3.1 (2026-05-19)</small>
+
+* fix: fixed outbox ack; ([2eb1c4e](https://github.com/easylayer/transport-sdk/commit/2eb1c4e))
+
+
+
 ## 1.3.0 (2026-03-23)
 
 * fix: fixed yarn lock file; ([bb48284](https://github.com/easylayer/transport-sdk/commit/bb48284))
