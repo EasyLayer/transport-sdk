@@ -140,14 +140,18 @@ export class IpcChildClient {
 
       case Actions.OutboxStreamBatch: {
         const p = msg.payload as OutboxStreamBatchPayload;
+        const correlationId = msg.correlationId;
+        if (!correlationId) return;
+
         try {
           await this.processBatchWithTimeout(p);
+          const okIndices = (p.events ?? []).map((_e, i) => i);
           const ack: Message<OutboxStreamAckPayload> = {
             action: Actions.OutboxStreamAck,
-            correlationId: msg.correlationId || randomUUID(),
+            correlationId,
             requestId: randomUUID(),
             timestamp: Date.now(),
-            payload: { ok: true, okIndices: (p.events ?? []).map((_e, i) => i) },
+            payload: { ok: true, okIndices, correlationId },
           } as any;
           (process as any).send?.(ack as any);
         } catch {

@@ -155,14 +155,17 @@ export class HttpClient {
         if (msg.action !== Actions.OutboxStreamBatch) return this.replyText(res, 422, 'invalid action');
 
         const p = msg.payload as OutboxStreamBatchPayload;
+        if (!msg.correlationId) return this.replyText(res, 400, 'missing correlationId');
         if (!p || !Array.isArray(p.events)) return this.replyText(res, 400, 'invalid payload');
 
         await this.processBatchWithTimeout(p);
 
+        const okIndices = p.events.map((_e, i) => i);
         const ack: Message<OutboxStreamAckPayload> = {
           action: Actions.OutboxStreamAck,
+          correlationId: msg.correlationId,
           timestamp: Date.now(),
-          payload: { ok: true, okIndices: p.events.map((_e, i) => i) },
+          payload: { ok: true, okIndices, correlationId: msg.correlationId },
         };
         return this.replyJson(res, 200, ack);
       }
@@ -203,6 +206,7 @@ export class HttpClient {
       if (msg.action !== Actions.OutboxStreamBatch) return res.status(422).send('invalid action');
 
       const p = msg.payload as OutboxStreamBatchPayload;
+      if (!msg.correlationId) return res.status(400).send('missing correlationId');
       if (!p || !Array.isArray(p.events)) return res.status(400).send('invalid payload');
 
       try {
@@ -211,10 +215,12 @@ export class HttpClient {
         return res.status(500).send(String(e?.message ?? e ?? 'internal error'));
       }
 
+      const okIndices = p.events.map((_e, i) => i);
       const ack: Message<OutboxStreamAckPayload> = {
         action: Actions.OutboxStreamAck,
+        correlationId: msg.correlationId,
         timestamp: Date.now(),
-        payload: { ok: true, okIndices: p.events.map((_e, i) => i) },
+        payload: { ok: true, okIndices, correlationId: msg.correlationId },
       };
       return res.status(200).json(ack);
     });

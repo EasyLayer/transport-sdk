@@ -361,6 +361,9 @@ Pass a custom timeout as the third argument: `client.query('MyQuery', dto, 15_00
 **`maxWireBytes` must match the server:**  
 If you change `maxWireBytes` on the client, set the same value on the server-side transport. Mismatches cause batches to be rejected.
 
+**Outbox ACK correlation:**
+Every inbound `outbox.stream.batch` must contain a `correlationId`. The SDK echoes the same value in `outbox.stream.ack` on the message envelope and in the ACK payload. Batches without `correlationId` are not dispatched and are not ACKed, because the producer cannot safely delete EventStore outbox rows without an exact batch ACK.
+
 **HTTP — always mount the handler before subscribing:**  
 The webhook server must be listening before the EasyLayer app starts pushing events. Start your HTTP server first, then call `subscribe`.
 

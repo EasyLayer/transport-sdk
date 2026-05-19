@@ -35,6 +35,7 @@ describe('HttpClient (unit)', () => {
 
     const payload = {
       action: Actions.OutboxStreamBatch,
+      correlationId: 'http-batch-1',
       payload: { events: [
         { eventType: 'BlockAddedEvent', payload: { id: 1 } },
         { eventType: 'BlockAddedEvent', payload: { id: 2 } },
@@ -47,20 +48,33 @@ describe('HttpClient (unit)', () => {
     expect(seen).toEqual([1, 2]);
     const ackPayload = JSON.parse(resEnd.mock.calls[0][0].toString());
     expect(ackPayload.action).toBe(Actions.OutboxStreamAck);
+    expect(ackPayload.correlationId).toBe('http-batch-1');
+    expect(ackPayload.payload.correlationId).toBe('http-batch-1');
   });
 
   it('returns 401 when token missing', async () => {
     const client = makeClient();
     const res = { writeHead: jest.fn(), end: jest.fn() } as unknown as ServerResponse;
-    await client.nodeHttpHandler(makeReq({ action: Actions.OutboxStreamBatch, payload: { events: [] } }), res);
+    await client.nodeHttpHandler(makeReq({ action: Actions.OutboxStreamBatch, correlationId: 'http-batch-empty', payload: { events: [] } }), res);
     expect(res.writeHead).toHaveBeenCalledWith(401, expect.any(Object));
+  });
+
+
+  it('returns 400 when outbox batch correlationId is missing', async () => {
+    const client = makeClient();
+    const res = { writeHead: jest.fn(), end: jest.fn() } as unknown as ServerResponse;
+    await client.nodeHttpHandler(
+      makeReq({ action: Actions.OutboxStreamBatch, payload: { events: [] } }, { 'x-transport-token': 't' }),
+      res,
+    );
+    expect(res.writeHead).toHaveBeenCalledWith(400, expect.any(Object));
   });
 
   it('ignores events with no subscriber and still ACKs', async () => {
     const client = makeClient();
     const resEnd = jest.fn();
     const res = { writeHead: jest.fn(), end: resEnd } as unknown as ServerResponse;
-    const payload = { action: Actions.OutboxStreamBatch, payload: { events: [{ eventType: 'Unknown', payload: {} }] } };
+    const payload = { action: Actions.OutboxStreamBatch, correlationId: 'http-batch-unknown', payload: { events: [{ eventType: 'Unknown', payload: {} }] } };
     await client.nodeHttpHandler(makeReq(payload, { 'x-transport-token': 't' }), res);
     expect(resEnd).toHaveBeenCalled();
   });
