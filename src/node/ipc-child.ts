@@ -5,14 +5,21 @@ import type {
   OutboxStreamAckPayload,
   QueryRequestPayload,
   QueryResponsePayload,
+  AckMode,
 } from '../core';
-import { Actions, createDomainEventFromWire } from '../core';
+import { Actions, createDomainEventFromWire, normalizeAckMode } from '../core';
 
 export type IpcChildClientOptions = {
   /** If set, included as { password } in Pong on app-level Ping. */
   pongPassword?: string;
-  /** Processing timeout for a batch before replying with ACK. Default: 3000 ms. */
+  /** Processing timeout for handler execution when ackMode='after-handler'. Default: 3000 ms. */
   processTimeoutMs?: number;
+  /**
+   * ACK policy for inbound outbox batches. Default: 'on-receive'.
+   * - on-receive: ACK immediately after envelope validation, then dispatch handlers asynchronously.
+   * - after-handler: ACK only after subscribed handlers finish successfully within processTimeoutMs.
+   */
+  ackMode?: AckMode;
 };
 
 function assertIpcChildRuntime() {
@@ -34,6 +41,7 @@ function assertIpcChildRuntime() {
 export class IpcChildClient {
   private readonly pongPassword?: string;
   private readonly processTimeoutMs: number;
+  private readonly ackMode: AckMode;
 
   // One handler per event type
   private subs = new Map<string, (evt: any) => unknown | Promise<unknown>>();
@@ -48,6 +56,7 @@ export class IpcChildClient {
     assertIpcChildRuntime();
     this.pongPassword = opts.pongPassword;
     this.processTimeoutMs = Math.max(1, opts.processTimeoutMs ?? 3000);
+    this.ackMode = normalizeAckMode(opts.ackMode);
 
     this.processMessageHandler = this.onProcessMessage.bind(this);
     (process as any).on('message', this.processMessageHandler);
@@ -141,21 +150,21 @@ export class IpcChildClient {
       case Actions.OutboxStreamBatch: {
         const p = msg.payload as OutboxStreamBatchPayload;
         const correlationId = msg.correlationId;
-        if (!correlationId) return;
+        if (!correlationId || !p || !Array.isArray(p.events)) return;
+
+        if (this.ackMode === 'on-receive') {
+          this.sendAck(correlationId, p.events.length);
+          void this.processBatchWithTimeout(p).catch(() => {
+            // ACK was already sent. Subscriber failures must be recovered by the application.
+          });
+          return;
+        }
 
         try {
           await this.processBatchWithTimeout(p);
-          const okIndices = (p.events ?? []).map((_e, i) => i);
-          const ack: Message<OutboxStreamAckPayload> = {
-            action: Actions.OutboxStreamAck,
-            correlationId,
-            requestId: randomUUID(),
-            timestamp: Date.now(),
-            payload: { ok: true, okIndices, correlationId },
-          } as any;
-          (process as any).send?.(ack as any);
+          this.sendAck(correlationId, p.events.length);
         } catch {
-          // No ACK on failure — server will retry
+          // In after-handler mode, do not ACK on failure — server will retry.
         }
         return;
       }
@@ -180,6 +189,18 @@ export class IpcChildClient {
     }
   }
   /* eslint-enable no-empty */
+
+  private sendAck(correlationId: string, eventCount: number): void {
+    const okIndices = Array.from({ length: eventCount }, (_e, i) => i);
+    const ack: Message<OutboxStreamAckPayload> = {
+      action: Actions.OutboxStreamAck,
+      correlationId,
+      requestId: randomUUID(),
+      timestamp: Date.now(),
+      payload: { ok: true, okIndices, correlationId },
+    } as any;
+    (process as any).send?.(ack as any);
+  }
 
   // ---- batch processing -----------------------------------------------------
   private async processBatchWithTimeout(batch: OutboxStreamBatchPayload): Promise<void> {

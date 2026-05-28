@@ -1,8 +1,8 @@
 import { URL } from 'node:url';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import express from 'express';
-import type { Message, OutboxStreamAckPayload, OutboxStreamBatchPayload, QueryResponsePayload } from '../core';
-import { Actions, createDomainEventFromWire, utf8Len, TRANSPORT_OVERHEAD_WIRE } from '../core';
+import type { AckMode, Message, OutboxStreamAckPayload, OutboxStreamBatchPayload, QueryResponsePayload } from '../core';
+import { Actions, createDomainEventFromWire, normalizeAckMode, utf8Len, TRANSPORT_OVERHEAD_WIRE } from '../core';
 
 export type HttpInboundOptions = {
   /** Full URL where the server will POST batches (defines exact path to mount). */
@@ -15,8 +15,10 @@ export type HttpInboundOptions = {
   pongPassword?: string;
   /** Maximum allowed wire size in bytes. Default: 1 MiB. */
   maxWireBytes?: number;
-  /** Processing timeout for a batch before replying. Default: 3000 ms. */
+  /** Processing timeout for handler execution when ackMode='after-handler'. Default: 3000 ms. */
   processTimeoutMs?: number;
+  /** ACK policy for inbound outbox batches. Default: 'on-receive'. */
+  ackMode?: AckMode;
 };
 
 export type HttpQueryOptions = {
@@ -40,7 +42,10 @@ export type SubscribeHandler<T = any> = (evt: T) => unknown | Promise<unknown>;
  *   * Events of the same type are processed **sequentially** in arrival order.
  *   * Different types are processed **in parallel**.
  *   * Types without a subscriber are ignored (no-op) and do not block ACK.
- * - Replies with ACK only after all relevant handlers finish within `processTimeoutMs`.
+ * - Default ACK mode is `on-receive`: reply with ACK as soon as the
+ *   transport envelope is accepted, then dispatch handlers asynchronously.
+ * - `after-handler` mode replies with ACK only after all relevant handlers
+ *   finish within `processTimeoutMs`.
  */
 export class HttpClient {
   private readonly webhook: URL;
@@ -49,6 +54,7 @@ export class HttpClient {
   private readonly pongPassword?: string;
   private readonly maxBytes: number;
   private readonly processTimeoutMs: number;
+  private readonly ackMode: AckMode;
   private readonly queryBase: string;
   private readonly defaultQueryTimeoutMs: number;
 
@@ -64,6 +70,7 @@ export class HttpClient {
     this.pongPassword = inbound.pongPassword;
     this.maxBytes = inbound.maxWireBytes ?? 10 * 1024 * 1024;
     this.processTimeoutMs = Math.max(1, inbound.processTimeoutMs ?? 3000);
+    this.ackMode = normalizeAckMode(inbound.ackMode);
 
     this.pingPath = (inbound.pingUrl ? new URL(inbound.pingUrl).pathname : '/ping').replace(/\/+$/, '') || '/ping';
     this.queryBase = query.baseUrl.replace(/\/+$/, '');
@@ -158,15 +165,16 @@ export class HttpClient {
         if (!msg.correlationId) return this.replyText(res, 400, 'missing correlationId');
         if (!p || !Array.isArray(p.events)) return this.replyText(res, 400, 'invalid payload');
 
-        await this.processBatchWithTimeout(p);
+        const ack = this.createAck(msg.correlationId, p.events.length);
+        if (this.ackMode === 'on-receive') {
+          this.replyJson(res, 200, ack);
+          void this.processBatchWithTimeout(p).catch(() => {
+            // ACK was already sent. Subscriber failures must be recovered by the application.
+          });
+          return;
+        }
 
-        const okIndices = p.events.map((_e, i) => i);
-        const ack: Message<OutboxStreamAckPayload> = {
-          action: Actions.OutboxStreamAck,
-          correlationId: msg.correlationId,
-          timestamp: Date.now(),
-          payload: { ok: true, okIndices, correlationId: msg.correlationId },
-        };
+        await this.processBatchWithTimeout(p);
         return this.replyJson(res, 200, ack);
       }
 
@@ -209,19 +217,20 @@ export class HttpClient {
       if (!msg.correlationId) return res.status(400).send('missing correlationId');
       if (!p || !Array.isArray(p.events)) return res.status(400).send('invalid payload');
 
+      const ack = this.createAck(msg.correlationId, p.events.length);
+      if (this.ackMode === 'on-receive') {
+        res.status(200).json(ack);
+        void this.processBatchWithTimeout(p).catch(() => {
+          // ACK was already sent. Subscriber failures must be recovered by the application.
+        });
+        return;
+      }
+
       try {
         await this.processBatchWithTimeout(p);
       } catch (e: any) {
         return res.status(500).send(String(e?.message ?? e ?? 'internal error'));
       }
-
-      const okIndices = p.events.map((_e, i) => i);
-      const ack: Message<OutboxStreamAckPayload> = {
-        action: Actions.OutboxStreamAck,
-        correlationId: msg.correlationId,
-        timestamp: Date.now(),
-        payload: { ok: true, okIndices, correlationId: msg.correlationId },
-      };
       return res.status(200).json(ack);
     });
 
@@ -230,6 +239,16 @@ export class HttpClient {
 
   async close(): Promise<void> {
     // No owned resources to release.
+  }
+
+  private createAck(correlationId: string, eventCount: number): Message<OutboxStreamAckPayload> {
+    const okIndices = Array.from({ length: eventCount }, (_e, i) => i);
+    return {
+      action: Actions.OutboxStreamAck,
+      correlationId,
+      timestamp: Date.now(),
+      payload: { ok: true, okIndices, correlationId },
+    };
   }
 
   // ---- batch processing helpers ---------------------------------------------

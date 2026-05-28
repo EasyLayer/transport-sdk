@@ -14,15 +14,15 @@ function makeReq(body: any, headers: Record<string, string> = {}) {
   return req;
 }
 
-function makeClient() {
+function makeClient(inbound: Record<string, any> = {}) {
   return new HttpClient(
-    { webhookUrl: 'http://localhost/events', pingUrl: 'http://localhost/ping', token: 't', processTimeoutMs: 30 },
+    { webhookUrl: 'http://localhost/events', pingUrl: 'http://localhost/ping', token: 't', processTimeoutMs: 30, ...inbound },
     { baseUrl: 'http://localhost:3000' },
   );
 }
 
 describe('HttpClient (unit)', () => {
-  it('ack only after sequential processing', async () => {
+  it('ackMode=on-receive ACKs immediately and still dispatches sequentially', async () => {
     const client = makeClient();
     const seen: number[] = [];
     client.subscribe('BlockAddedEvent', async (evt: any) => {
@@ -80,7 +80,7 @@ describe('HttpClient (unit)', () => {
   });
 
   it('processBatchWithTimeout rejects if handler never resolves', async () => {
-    const client = makeClient();
+    const client = makeClient({ ackMode: 'after-handler' });
     client.subscribe('Slow', () => new Promise(() => {}));
     await expect(
       client['processBatchWithTimeout']({ events: [{ eventType: 'Slow', payload: {} }] } as any),

@@ -1,8 +1,8 @@
 /* eslint-disable no-restricted-syntax */
 import WebSocket from 'ws';
 /* eslint-enable no-restricted-syntax */
-import { Actions, createDomainEventFromWire, utf8Len, TRANSPORT_OVERHEAD_WIRE } from '../core';
-import type { Message, OutboxStreamBatchPayload, OutboxStreamAckPayload, QueryResponsePayload } from '../core';
+import { Actions, createDomainEventFromWire, normalizeAckMode, utf8Len, TRANSPORT_OVERHEAD_WIRE } from '../core';
+import type { AckMode, Message, OutboxStreamBatchPayload, OutboxStreamAckPayload, QueryResponsePayload } from '../core';
 
 export type WsClientOptions = {
   url: string; // e.g. wss://server:8443/ws
@@ -10,7 +10,10 @@ export type WsClientOptions = {
   clientId?: string; // sent in Sec-WebSocket-Protocol (second protocol)
   pongPassword?: string; // included in Pong payload when replying to app-level Ping
   maxWireBytes?: number; // default 10 MiB — must match server transportMaxFrameBytes
-  processTimeoutMs?: number; // default 3000
+  /** Processing timeout for handler execution when ackMode='after-handler'. Default: 3000 ms. */
+  processTimeoutMs?: number;
+  /** ACK policy for inbound outbox batches. Default: 'on-receive'. */
+  ackMode?: AckMode;
   /**
    * Optional factory for creating WebSocket instances in managed mode.
    * If provided, connect() and internal reconnects will use this factory.
@@ -34,6 +37,7 @@ export class WsClient {
   private readonly pongPassword?: string;
   private readonly maxBytes: number;
   private readonly processTimeoutMs: number;
+  private readonly ackMode: AckMode;
   private readonly socketFactory?: () => WebSocket;
 
   private ws: WebSocket | null = null;
@@ -55,6 +59,7 @@ export class WsClient {
     this.pongPassword = opts.pongPassword;
     this.maxBytes = Math.max(1024, opts.maxWireBytes ?? 10 * 1024 * 1024);
     this.processTimeoutMs = Math.max(1, opts.processTimeoutMs ?? 3000);
+    this.ackMode = normalizeAckMode(opts.ackMode);
     this.socketFactory = opts.socketFactory;
   }
 
@@ -185,20 +190,21 @@ export class WsClient {
       case Actions.OutboxStreamBatch: {
         const p = msg.payload as OutboxStreamBatchPayload;
         const correlationId = msg.correlationId;
-        if (!correlationId) break;
+        if (!correlationId || !p || !Array.isArray(p.events)) break;
+
+        if (this.ackMode === 'on-receive') {
+          this.sendAck(correlationId, p.events.length);
+          void this.processBatchWithTimeout(p).catch(() => {
+            // ACK was already sent. Subscriber failures must be recovered by the application.
+          });
+          break;
+        }
 
         try {
           await this.processBatchWithTimeout(p);
-          const okIndices = p.events.map((_e, i) => i);
-          const ack: Message<OutboxStreamAckPayload> = {
-            action: Actions.OutboxStreamAck,
-            correlationId,
-            timestamp: Date.now(),
-            payload: { ok: true, okIndices, correlationId },
-          } as any;
-          this.ws?.send(JSON.stringify(ack));
+          this.sendAck(correlationId, p.events.length);
         } catch {
-          // No ACK on failure — server will retry
+          // In after-handler mode, do not ACK on failure — server will retry.
         }
         break;
       }
@@ -218,6 +224,17 @@ export class WsClient {
     }
   };
   /* eslint-enable no-empty */
+
+  private sendAck(correlationId: string, eventCount: number): void {
+    const okIndices = Array.from({ length: eventCount }, (_e, i) => i);
+    const ack: Message<OutboxStreamAckPayload> = {
+      action: Actions.OutboxStreamAck,
+      correlationId,
+      timestamp: Date.now(),
+      payload: { ok: true, okIndices, correlationId },
+    } as any;
+    this.ws?.send(JSON.stringify(ack));
+  }
 
   // ---- batch processing -----------------------------------------------------
   private async processBatchWithTimeout(batch: OutboxStreamBatchPayload): Promise<void> {

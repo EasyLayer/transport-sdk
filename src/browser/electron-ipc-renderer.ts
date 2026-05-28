@@ -4,8 +4,9 @@ import type {
   OutboxStreamBatchPayload,
   QueryRequestPayload,
   QueryResponsePayload,
+  AckMode,
 } from '../core';
-import { Actions, createDomainEventFromWire, uuid, nextBackoff, delay } from '../core';
+import { Actions, createDomainEventFromWire, normalizeAckMode, uuid, nextBackoff, delay } from '../core';
 
 /**
  * ElectronRendererTransport (browser-side in renderer)
@@ -23,6 +24,7 @@ import { Actions, createDomainEventFromWire, uuid, nextBackoff, delay } from '..
 export class ElectronRendererTransport {
   private readonly ipc: IpcRendererLike;
   private readonly pongPassword?: string;
+  private readonly ackMode: AckMode;
 
   private subs = new Map<string, Set<(evt: any) => unknown | Promise<unknown>>>();
   private pendingQueries = new Map<string, (payload: any) => void>();
@@ -31,9 +33,10 @@ export class ElectronRendererTransport {
 
   private readonly onIpc = (_: any, raw: unknown) => this.handleIncoming(raw);
 
-  constructor(opts?: { ipcRenderer?: IpcRendererLike; pongPassword?: string }) {
+  constructor(opts?: { ipcRenderer?: IpcRendererLike; pongPassword?: string; ackMode?: AckMode }) {
     this.ipc = opts?.ipcRenderer ?? getIpcRenderer();
     this.pongPassword = opts?.pongPassword;
+    this.ackMode = normalizeAckMode(opts?.ackMode);
 
     this.ipc.on('transport:message', this.onIpc);
   }
@@ -153,21 +156,16 @@ export class ElectronRendererTransport {
         const correlationId = msg.correlationId;
         if (!correlationId || !p || !Array.isArray(p.events)) return;
 
-        for (const wire of p.events) {
-          const set = this.subs.get(wire.eventType || 'UnknownEvent');
-          if (!set?.size) continue;
-          const evt = createDomainEventFromWire(wire);
-          for (const h of set) await h(evt);
+        if (this.ackMode === 'on-receive') {
+          this.sendAck(correlationId, p.events.length);
+          void this.dispatchBatch(p).catch(() => {
+            // ACK was already sent. Subscriber failures must be recovered by the application.
+          });
+          return;
         }
 
-        const okIndices = p.events.map((_e, i) => i);
-        const ack: Message<OutboxStreamAckPayload> = {
-          action: Actions.OutboxStreamAck,
-          correlationId,
-          timestamp: Date.now(),
-          payload: { ok: true, okIndices, correlationId },
-        };
-        this.ipc.send('transport:message', ack);
+        await this.dispatchBatch(p);
+        this.sendAck(correlationId, p.events.length);
         return;
       }
 
@@ -188,6 +186,26 @@ export class ElectronRendererTransport {
     }
   }
   /* eslint-enable no-empty */
+
+  private async dispatchBatch(batch: OutboxStreamBatchPayload): Promise<void> {
+    for (const wire of batch.events ?? []) {
+      const set = this.subs.get(wire.eventType || 'UnknownEvent');
+      if (!set?.size) continue;
+      const evt = createDomainEventFromWire(wire);
+      for (const h of set) await h(evt);
+    }
+  }
+
+  private sendAck(correlationId: string, eventCount: number): void {
+    const okIndices = Array.from({ length: eventCount }, (_e, i) => i);
+    const ack: Message<OutboxStreamAckPayload> = {
+      action: Actions.OutboxStreamAck,
+      correlationId,
+      timestamp: Date.now(),
+      payload: { ok: true, okIndices, correlationId },
+    };
+    this.ipc.send('transport:message', ack);
+  }
 }
 
 // -----------------------------------------------------------------------------

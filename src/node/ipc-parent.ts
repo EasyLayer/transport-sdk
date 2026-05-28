@@ -6,16 +6,23 @@ import type {
   OutboxStreamAckPayload,
   QueryRequestPayload,
   QueryResponsePayload,
+  AckMode,
 } from '../core';
-import { Actions, createDomainEventFromWire } from '../core';
+import { Actions, createDomainEventFromWire, logTransportDiagnostic, normalizeAckMode } from '../core';
 
 export type IpcParentClientOptions = {
   /** A connected ChildProcess created with stdio including 'ipc'. */
   child: ChildProcess;
   /** If set, included as { password } in Pong on app-level Ping. */
   pongPassword?: string;
-  /** Processing timeout for a batch before replying with ACK. Default: 3000 ms. */
+  /** Processing timeout for handler execution when ackMode='after-handler'. Default: 3000 ms. */
   processTimeoutMs?: number;
+  /**
+   * ACK policy for inbound outbox batches. Default: 'on-receive'.
+   * - on-receive: ACK immediately after envelope validation, then dispatch handlers asynchronously.
+   * - after-handler: ACK only after subscribed handlers finish successfully within processTimeoutMs.
+   */
+  ackMode?: AckMode;
 };
 
 function assertIpcParentRuntime() {
@@ -38,6 +45,7 @@ export class IpcParentClient {
   private readonly child: ChildProcess;
   private readonly pongPassword?: string;
   private readonly processTimeoutMs: number;
+  private readonly ackMode: AckMode;
 
   // One handler per event type (sequential per type, parallel across types)
   private subs = new Map<string, (evt: any) => unknown | Promise<unknown>>();
@@ -61,6 +69,13 @@ export class IpcParentClient {
     this.child = opts.child;
     this.pongPassword = opts.pongPassword;
     this.processTimeoutMs = Math.max(1, opts.processTimeoutMs ?? 3000);
+    this.ackMode = normalizeAckMode(opts.ackMode);
+
+    logTransportDiagnostic('ipc-parent', 'initialized', {
+      ackMode: this.ackMode,
+      processTimeoutMs: this.processTimeoutMs,
+      childPid: this.child.pid ?? null,
+    });
 
     this.childMessageHandler = this.onChildMessage.bind(this);
     this.child.on('message', this.childMessageHandler);
@@ -158,21 +173,48 @@ export class IpcParentClient {
       case Actions.OutboxStreamBatch: {
         const p = msg.payload as OutboxStreamBatchPayload;
         const correlationId = msg.correlationId;
-        if (!correlationId) return;
+        if (!correlationId || !p || !Array.isArray(p.events)) return;
+
+        logTransportDiagnostic('ipc-parent', 'outbox_batch_received', {
+          correlationId,
+          eventCount: p.events.length,
+          ackMode: this.ackMode,
+          processTimeoutMs: this.processTimeoutMs,
+          firstEventType: p.events[0]?.eventType ?? null,
+          firstBlockHeight: p.events[0]?.blockHeight ?? null,
+          lastBlockHeight: p.events[p.events.length - 1]?.blockHeight ?? null,
+        });
+
+        if (this.ackMode === 'on-receive') {
+          this.sendAck(correlationId, p.events.length, 'on-receive');
+          void this.processBatchWithTimeout(p)
+            .then(() => {
+              logTransportDiagnostic('ipc-parent', 'outbox_batch_processed_after_ack', {
+                correlationId,
+                eventCount: p.events.length,
+              });
+            })
+            .catch((error) => {
+              logTransportDiagnostic('ipc-parent', 'outbox_batch_handler_failed_after_ack', {
+                correlationId,
+                eventCount: p.events.length,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              // ACK was already sent. Subscriber failures must be recovered by the application.
+            });
+          return;
+        }
 
         try {
           await this.processBatchWithTimeout(p);
-          const okIndices = (p.events ?? []).map((_e, i) => i);
-          const ack: Message<OutboxStreamAckPayload> = {
-            action: Actions.OutboxStreamAck,
+          this.sendAck(correlationId, p.events.length, 'after-handler');
+        } catch (error) {
+          logTransportDiagnostic('ipc-parent', 'outbox_batch_not_acked_after_handler_failure', {
             correlationId,
-            requestId: randomUUID(),
-            timestamp: Date.now(),
-            payload: { ok: true, okIndices, correlationId },
-          } as any;
-          this.child.send?.(ack as any);
-        } catch {
-          // on failure do not ACK: server will retry
+            eventCount: p.events.length,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          // In after-handler mode, do not ACK on failure — server will retry.
         }
         return;
       }
@@ -197,6 +239,19 @@ export class IpcParentClient {
     }
   }
   /* eslint-enable no-empty */
+
+  private sendAck(correlationId: string, eventCount: number, ackMode: AckMode): void {
+    const okIndices = Array.from({ length: eventCount }, (_e, i) => i);
+    const ack: Message<OutboxStreamAckPayload> = {
+      action: Actions.OutboxStreamAck,
+      correlationId,
+      requestId: randomUUID(),
+      timestamp: Date.now(),
+      payload: { ok: true, okIndices, correlationId },
+    } as any;
+    this.child.send?.(ack as any);
+    logTransportDiagnostic('ipc-parent', 'outbox_ack_sent', { correlationId, eventCount, ackMode });
+  }
 
   // ---- batch processing -----------------------------------------------------
   private async processBatchWithTimeout(batch: OutboxStreamBatchPayload): Promise<void> {

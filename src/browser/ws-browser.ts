@@ -1,5 +1,5 @@
-import type { Message, OutboxStreamAckPayload, OutboxStreamBatchPayload } from '../core';
-import { Actions, createDomainEventFromWire } from '../core';
+import type { AckMode, Message, OutboxStreamAckPayload, OutboxStreamBatchPayload } from '../core';
+import { Actions, createDomainEventFromWire, normalizeAckMode } from '../core';
 
 /**
  * WsBrowserClient
@@ -22,6 +22,7 @@ export class WsBrowserClient {
   private readonly url: string;
   private readonly protocols?: string | string[];
   private readonly pongPassword?: string;
+  private readonly ackMode: AckMode;
 
   private reconnect?: { min: number; max: number; factor: number; jitter: number; enabled: boolean };
   private reconnectTimer?: number;
@@ -36,11 +37,13 @@ export class WsBrowserClient {
     protocols?: string | string[]; // optional subprotocols
     pongPassword?: string; // will be included in pong.payload.password
     reconnect?: { minMs?: number; maxMs?: number; factor?: number; jitter?: number; enabled?: boolean };
+    ackMode?: AckMode;
   }) {
     if (!opts?.url) throw new Error('[ws-browser] url is required');
     this.url = opts.url;
     this.protocols = opts.protocols;
     this.pongPassword = opts.pongPassword;
+    this.ackMode = normalizeAckMode(opts.ackMode);
 
     const r = opts.reconnect ?? {};
     this.reconnect = {
@@ -170,21 +173,16 @@ export class WsBrowserClient {
         const correlationId = msg.correlationId;
         if (!correlationId || !p || !Array.isArray(p.events)) return;
 
-        for (const wire of p.events) {
-          const set = this.subs.get(wire.eventType || 'UnknownEvent');
-          if (!set?.size) continue;
-          const evt = createDomainEventFromWire(wire);
-          for (const h of set) await h(evt);
+        if (this.ackMode === 'on-receive') {
+          this.sendAck(correlationId, p.events.length);
+          void this.dispatchBatch(p).catch(() => {
+            // ACK was already sent. Subscriber failures must be recovered by the application.
+          });
+          return;
         }
 
-        const okIndices = p.events.map((_e, i) => i);
-        const ack: Message<OutboxStreamAckPayload> = {
-          action: Actions.OutboxStreamAck,
-          correlationId,
-          timestamp: Date.now(),
-          payload: { ok: true, okIndices, correlationId },
-        };
-        this.send(ack);
+        await this.dispatchBatch(p);
+        this.sendAck(correlationId, p.events.length);
         return;
       }
 
@@ -194,6 +192,26 @@ export class WsBrowserClient {
     }
   }
   /* eslint-enable no-empty */
+
+  private async dispatchBatch(batch: OutboxStreamBatchPayload): Promise<void> {
+    for (const wire of batch.events ?? []) {
+      const set = this.subs.get(wire.eventType || 'UnknownEvent');
+      if (!set?.size) continue;
+      const evt = createDomainEventFromWire(wire);
+      for (const h of set) await h(evt);
+    }
+  }
+
+  private sendAck(correlationId: string, eventCount: number): void {
+    const okIndices = Array.from({ length: eventCount }, (_e, i) => i);
+    const ack: Message<OutboxStreamAckPayload> = {
+      action: Actions.OutboxStreamAck,
+      correlationId,
+      timestamp: Date.now(),
+      payload: { ok: true, okIndices, correlationId },
+    };
+    this.send(ack);
+  }
 
   private send(frame: Message | string) {
     const s = this.socket;

@@ -35,6 +35,7 @@ class FakeSocket extends EventEmitter {
 
 function makeClientWithFakeSocket(hooks?: {
   factory?: () => FakeSocket;
+  clientOptions?: Partial<ConstructorParameters<typeof WsClient>[0]>;
 }) {
   const sock = new FakeSocket();
   const factory = hooks?.factory ?? (() => sock);
@@ -42,6 +43,7 @@ function makeClientWithFakeSocket(hooks?: {
     url: 'ws://fake',
     processTimeoutMs: 30,
     socketFactory: factory as unknown as () => WebSocket,
+    ...hooks?.clientOptions,
   });
   return { client, sock };
 }
@@ -143,8 +145,8 @@ describe('WsClient', () => {
     expect(ackRaw).toBeUndefined();
   });
 
-  it('OutboxStreamBatch: timeout → NO ACK', async () => {
-    const { client, sock } = makeClientWithFakeSocket();
+  it('OutboxStreamBatch: timeout → NO ACK in after-handler mode', async () => {
+    const { client, sock } = makeClientWithFakeSocket({ clientOptions: { ackMode: 'after-handler' } });
     (client as any).processTimeoutMs = 5;
     const p = client.connect();
     sock.openNow();

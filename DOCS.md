@@ -33,6 +33,31 @@ Every client does two things:
 
 Events are processed **sequentially per type** and **in parallel across types**. Only one handler per event type is allowed (duplicate registration throws). If no handler is registered for an event type, it is silently ignored and still acknowledged.
 
+### ACK mode
+
+Inbound outbox batches use an explicit ACK policy:
+
+| Mode | Default | Meaning |
+|---|---:|---|
+| `on-receive` | yes | ACK is sent immediately after the transport envelope is accepted. Subscriber handlers run asynchronously after ACK. This is the preferred mode for high-throughput consumers that checkpoint/recover through queries. |
+| `after-handler` | no | ACK is sent only after subscribed handlers finish successfully within `processTimeoutMs`. Handler failure/timeout suppresses ACK and the producer may redeliver the batch. |
+
+`on-receive` means ACK confirms **delivery to the client process**, not that the application has fully processed or durably stored the event. Consumers that use this mode must make their ingestion path idempotent and recover missed work through queries/checkpoints, for example `FetchEventsQuery` from the last durable projection checkpoint.
+
+### Transport diagnostics
+
+Set `EASYLAYER_TRANSPORT_DIAGNOSTIC_LOGS=1` (or `TRANSPORT_SDK_DIAGNOSTIC_LOGS=1`) to print transport-level diagnostics to stderr.
+
+For IPC parent consumers this logs:
+
+- effective `ackMode`;
+- `processTimeoutMs`;
+- inbound outbox batch `correlationId`, event count and height range;
+- when ACK is sent;
+- whether handler processing completed or failed after ACK in `on-receive` mode.
+
+This is useful when validating that high-volume consumers use `ackMode: 'on-receive'` and are not accidentally redelivering outbox rows because ACK waits for application processing.
+
 ---
 
 ## Node.js Transports
@@ -87,7 +112,8 @@ const result = await client.query('GetBalanceQuery', { address: '1A1z...' });
 | `pongPassword` | `string` | — | Included in the Pong reply payload so the server accepts the connection. |
 | `pingUrl` | `string` | same path as webhook | Separate path for ping, if the server uses a different endpoint. |
 | `maxWireBytes` | `number` | `10485760` (10 MiB) | Maximum accepted batch size in bytes. Must match the server setting. |
-| `processTimeoutMs` | `number` | `3000` | Time allowed to process a batch before sending ACK. |
+| `processTimeoutMs` | `number` | `3000` | Time allowed to process a batch before sending ACK when `ackMode='after-handler'`. |
+| `ackMode` | `'on-receive' \| 'after-handler'` | `'on-receive'` | Controls whether ACK is sent immediately on envelope receipt or after subscriber handlers finish. |
 | `baseUrl` | `string` | **required** | EasyLayer app base URL. Queries POST to `${baseUrl}/query`. |
 | `defaultQueryTimeoutMs` | `number` | `5000` | Default query timeout. Can be overridden per-call. |
 
@@ -145,7 +171,8 @@ client.attachWs(ws);
 | `clientId` | `string` | — | Optional client identifier (second subprotocol slot). |
 | `pongPassword` | `string` | — | Included in Pong payload. |
 | `maxWireBytes` | `number` | `10485760` | Maximum frame size in bytes. Must match server. |
-| `processTimeoutMs` | `number` | `3000` | Batch processing timeout. |
+| `processTimeoutMs` | `number` | `3000` | Batch processing timeout when `ackMode='after-handler'`. |
+| `ackMode` | `'on-receive' \| 'after-handler'` | `'on-receive'` | Controls whether ACK is sent immediately on envelope receipt or after subscriber handlers finish. |
 | `socketFactory` | `() => WebSocket` | — | Custom factory for creating WebSocket instances in managed mode. |
 
 ---
@@ -181,6 +208,15 @@ const result = await client.query('RunTaskQuery', { input: 'data' });
 
 > The child **must** be spawned with `'ipc'` in `stdio`. The client validates this and throws if the channel is missing.
 
+#### IPC Parent Options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `child` | `ChildProcess` | **required** | Forked child process with IPC channel. |
+| `pongPassword` | `string` | — | Included in Pong payload. |
+| `processTimeoutMs` | `number` | `3000` | Handler timeout when `ackMode='after-handler'`. |
+| `ackMode` | `'on-receive' \| 'after-handler'` | `'on-receive'` | ACK immediately on receipt or after handlers finish. |
+
 ---
 
 ### IPC Child
@@ -208,6 +244,14 @@ const config = await client.query('GetConfigQuery', {});
 ```
 
 Parallel queries are supported on both sides via `correlationId` tracking.
+
+#### IPC Child Options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `pongPassword` | `string` | — | Included in Pong payload. |
+| `processTimeoutMs` | `number` | `3000` | Handler timeout when `ackMode='after-handler'`. |
+| `ackMode` | `'on-receive' \| 'after-handler'` | `'on-receive'` | ACK immediately on receipt or after handlers finish. |
 
 ---
 
@@ -363,6 +407,9 @@ If you change `maxWireBytes` on the client, set the same value on the server-sid
 
 **Outbox ACK correlation:**
 Every inbound `outbox.stream.batch` must contain a `correlationId`. The SDK echoes the same value in `outbox.stream.ack` on the message envelope and in the ACK payload. Batches without `correlationId` are not dispatched and are not ACKed, because the producer cannot safely delete EventStore outbox rows without an exact batch ACK.
+
+**ACK mode and recovery:**
+The default `ackMode` is `on-receive`. In this mode the SDK ACKs after validating the transport envelope and before awaiting user handlers. This prevents heavy application work from blocking producer outbox cleanup. If the consumer crashes after ACK but before durable processing, it must recover using queries/checkpoints. Use `after-handler` only when the producer must redeliver if subscriber handlers fail or time out.
 
 **HTTP — always mount the handler before subscribing:**  
 The webhook server must be listening before the EasyLayer app starts pushing events. Start your HTTP server first, then call `subscribe`.

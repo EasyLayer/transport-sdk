@@ -41,6 +41,46 @@ export type WireEventRecord = {
 export type OutboxStreamBatchPayload = { events: WireEventRecord[] };
 export type OutboxStreamAckPayload = { ok: boolean; okIndices?: number[]; correlationId?: string; err?: string };
 
+/**
+ * Controls when an inbound outbox batch is acknowledged to the producer.
+ *
+ * - `on-receive` (default): ACK immediately after the transport envelope is
+ *   accepted. Subscriber handlers run asynchronously after ACK. This keeps
+ *   live delivery from being blocked by application work; consumers must be
+ *   able to recover missed work through queries/checkpoints.
+ * - `after-handler`: ACK only after subscribed handlers finish successfully
+ *   within `processTimeoutMs`. Handler failure/timeout suppresses ACK and the
+ *   producer may redeliver the batch.
+ */
+export type AckMode = 'on-receive' | 'after-handler';
+
+export function normalizeAckMode(value?: AckMode): AckMode {
+  return value === 'after-handler' ? 'after-handler' : 'on-receive';
+}
+
+export function isTransportDiagnosticLogsEnabled(): boolean {
+  const env = (globalThis as any)?.process?.env;
+  return env?.EASYLAYER_TRANSPORT_DIAGNOSTIC_LOGS === '1' || env?.TRANSPORT_SDK_DIAGNOSTIC_LOGS === '1';
+}
+
+export function logTransportDiagnostic(transport: string, event: string, args: Record<string, unknown> = {}): void {
+  if (!isTransportDiagnosticLogsEnabled()) return;
+  const payload = {
+    ts: new Date().toISOString(),
+    level: 'debug',
+    component: 'transport-sdk',
+    transport,
+    event,
+    args,
+  };
+  // Keep transport-sdk dependency-free: use stderr so app stdout streams remain clean.
+  try {
+    console.error(JSON.stringify(payload));
+  } catch {
+    console.error(`[transport-sdk] ${transport} ${event}`);
+  }
+}
+
 export type QueryRequestPayload = { name: string; dto?: unknown };
 export type QueryResponsePayload = { ok: boolean; name?: string; data?: any; err?: string };
 
