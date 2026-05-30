@@ -1,3 +1,9 @@
+## <small>1.3.2 (2026-05-30)</small>
+
+* feat: added ack modes; ([04a7c1e](https://github.com/easylayer/transport-sdk/commit/04a7c1e))
+
+
+
 ## <small>1.3.1 (2026-05-19)</small>
 
 * fix: fixed outbox ack; ([2eb1c4e](https://github.com/easylayer/transport-sdk/commit/2eb1c4e))
